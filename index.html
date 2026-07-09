@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="ru" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YADR Provisioner</title>
+    <link href="/bootstrap.min.css" rel="stylesheet">
+    <script src="/vue.global.js"></script>
+    <script src="/axios.min.js"></script>
+</head>
+<body class="bg-body-tertiary">
+    <div id="app" class="container-fluid px-4 mt-4">
+        <h2 class="fw-bold text-primary mb-4">🪄 YADR Auto-Provisioner</h2>
+
+        <!-- Навигация по вкладкам -->
+        <ul class="nav nav-tabs mb-4">
+            <li class="nav-item">
+                <button class="nav-link" :class="{ active: tab === 'pending' }" @click="tab = 'pending'">🔍 Обнаружение</button>
+            </li>
+            <li class="nav-item">
+                <button class="nav-link" :class="{ active: tab === 'cleanup' }" @click="tab = 'cleanup'">🗑️ Очистка</button>
+            </li>
+            <li class="nav-item">
+                <button class="nav-link" :class="{ active: tab === 'state' }" @click="tab = 'state'">📦 Состояние Caddy</button>
+            </li>
+        </ul>
+
+        <!-- Вкладка 1: Обнаружение -->
+        <div v-show="tab === 'pending'" class="card shadow-sm mb-4">
+            <div class="card-header bg-warning text-dark fw-bold d-flex justify-content-between align-items-center">
+                <span>Обнаружены новые устройства</span>
+                <button @click="loadPending" class="btn btn-sm btn-dark">🔄 Обновить</button>
+            </div>
+            <div class="card-body p-0">
+             <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead><tr><th>MAC Адрес</th><th>Временный IP</th><th>Действие</th></tr></thead>
+                    <tbody>
+                        <tr v-for="dev in pending" :key="dev.mac">
+                            <td class="font-monospace align-middle">{{ dev.mac }}</td>
+                            <td class="align-middle">{{ dev.ip }}</td>
+                            <td class="text-end">
+                                <button @click="provision(dev.mac, false)" class="btn btn-sm btn-success fw-bold me-1" :disabled="loading === dev.mac">
+                                    {{ loading === dev.mac ? 'Настройка...' : '🪄 Полная' }}
+                                </button>
+                                <button @click="provision(dev.mac, true)" class="btn btn-sm btn-outline-primary fw-bold" :disabled="loading === dev.mac">
+                                    🌐 Только DNS
+                                </button>
+                            </td>
+                        </tr>
+                        <tr v-if="pending.length === 0"><td colspan="3" class="text-center p-4 text-muted">Нет новых устройств.</td></tr>
+                    </tbody>
+                </table>
+             </div>
+            </div>
+        </div>
+
+        <!-- Вкладка 2: Очистка -->
+        <div v-show="tab === 'cleanup'" class="card shadow-sm border-danger">
+            <div class="card-header bg-danger text-white fw-bold">
+                Очистка инфраструктуры (De-provision)
+            </div>
+            <div class="card-body">
+                <p class="text-muted small">Введите MAC-адрес <b>выключенного</b> контейнера. Плагин сам найдет его и удалит настройки.</p>
+                <div class="row g-2">
+                    <div class="col-md-9">
+                        <input v-model="deprovMac" class="form-control font-monospace" placeholder="Например: AA:BB:CC:11:22:33">
+                    </div>
+                    <div class="col-md-3">
+                        <button @click="deprovision" class="btn btn-danger w-100 fw-bold" :disabled="!deprovMac">🗑️ Удалить всё</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Вкладка 3: Состояние Caddy -->
+        <div v-show="tab === 'state'">
+            <div class="card shadow-sm mb-3">
+                <div class="card-header bg-info text-dark fw-bold d-flex justify-content-between align-items-center">
+                    <span>Таблица назначений Caddy (routes.json)</span>
+                    <div>
+                        <button @click="loadState" class="btn btn-sm btn-dark me-1">🔃 Обновить таблицу</button>
+                        <button @click="replayCaddy" class="btn btn-sm btn-success fw-bold" :disabled="replaying">
+                            {{ replaying ? 'Восстановление...' : '🔄 Обновить API' }}
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                    <table class="table table-hover table-sm mb-0">
+                        <thead>
+                            <tr>
+                                <th>Domain</th>
+                                <th>IP</th>
+                                <th>Port</th>
+                                <th>Proto</th>
+                                <th>Node</th>
+                                <th>Route ID</th>
+                                <th>TLS ID</th>
+                                <th>Updated</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-for="rec in state" :key="rec.route_id">
+                                <td class="font-monospace">{{ rec.domain }}</td>
+                                <td class="font-monospace">{{ rec.target_ip }}</td>
+                                <td>{{ rec.target_port }}</td>
+                                <td><span class="badge bg-secondary">{{ rec.protocol }}</span></td>
+                                <td>{{ rec.node }}</td>
+                                <td class="font-monospace small">{{ rec.route_id }}</td>
+                                <td class="font-monospace small">{{ rec.tls_id }}</td>
+                                <td class="small text-muted">{{ rec.updated_at }}</td>
+                            </tr>
+                            <tr v-if="state.length === 0">
+                                <td colspan="8" class="text-center p-4 text-muted">Файл пуст. Настройте хотя бы один контейнер.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    </div>
+                </div>
+            </div>
+            <p class="text-muted small">
+                Кнопка <b>«Обновить API»</b> читает эту таблицу и повторно пушит все маршруты и TLS-политики в Caddy
+                через UPSERT (PUT для существующих, POST для новых), затем один раз перезапускает Caddy на каждой затронутой ноде.
+                Используй после жёсткого сброса Caddy.
+            </p>
+        </div>
+    </div>
+
+    <script>
+        const { createApp, ref, onMounted } = Vue
+
+        const api = axios.create({
+            baseURL: window.location.pathname.replace(/\/+$/, '')
+        })
+
+        createApp({
+            setup() {
+                const pending = ref([])
+                const loading = ref('')
+                const deprovMac = ref('')
+                const tab = ref('pending')
+                const state = ref([])
+                const replaying = ref(false)
+
+                async function loadPending() {
+                    try {
+                        const res = await api.get('/api/pending')
+                        pending.value = res.data || []
+                    } catch(e) { console.error(e) }
+                }
+
+                async function provision(mac, dnsOnly) {
+                    loading.value = mac
+                    try {
+                        const res = await api.post('/api/provision', { mac, dnsOnly })
+                        alert(res.data.message)
+                        loadPending()
+                    } catch(e) {
+                        alert(e.response?.data?.error || "Ошибка")
+                    } finally { loading.value = '' }
+                }
+
+                async function deprovision() {
+                    if(!deprovMac.value) return
+                    if(!confirm("Удалить конфиги для " + deprovMac.value + "?")) return
+                    try {
+                        const res = await api.delete('/api/deprovision', { data: { mac: deprovMac.value } })
+                        alert(res.data.message)
+                        deprovMac.value = ''
+                        loadPending()
+                    } catch(e) { alert(e.response?.data?.error || "Ошибка удаления") }
+                }
+
+                async function loadState() {
+                    try {
+                        const res = await api.get('/api/state')
+                        state.value = res.data || []
+                    } catch(e) {
+                        alert(e.response?.data?.error || "Ошибка загрузки состояния")
+                    }
+                }
+
+                async function replayCaddy() {
+                    if(!confirm("Перезаписать конфиг Caddy из файла таблицы? Это перезапустит Caddy на затронутых нодах.")) return
+                    replaying.value = true
+                    try {
+                        const res = await api.post('/api/replay')
+                        const d = res.data
+                        const errs = d.errors && d.errors.length
+                        let msg = `Восстановлено: ${d.ok}`
+                        if (errs) {
+                            msg += `\nОшибки (${d.errors.length}):\n` + d.errors.join('\n')
+                        }
+                        alert(msg)
+                        loadState()
+                    } catch(e) {
+                        alert(e.response?.data?.error || "Ошибка восстановления")
+                    } finally { replaying.value = false }
+                }
+
+                onMounted(() => {
+                    loadPending()
+                    loadState()
+                })
+
+                return { pending, loading, loadPending, provision, deprovision, deprovMac,
+                         tab, state, replaying, loadState, replayCaddy }
+            }
+        }).mount('#app')
+    </script>
+</body>
+</html>

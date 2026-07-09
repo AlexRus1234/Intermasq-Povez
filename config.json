@@ -1,0 +1,22 @@
+{
+    "intermasq_url": "http://172.20.0.1:8080/api",
+    "intermasq_key": "SuperSecretRandomString2025",
+    "base_domain": ".internal",
+    
+    "nodes": {
+        "yadr00": {
+            "subnet": "172.20.5",
+            "caddy_url": "http://172.20.5.3:2019",
+            "pve_url": "https://172.20.5.1:8006/api2/json",
+            "pve_token_id": "testWD@pam!test2",
+            "pve_secret": "bc293dfb-eb87-4131-8861-0e853133551c"
+        },
+        "yadr01": {
+            "subnet": "172.20.6",
+            "caddy_url": "http://172.20.6.3:2019",
+            "pve_url": "https://172.20.6.1:8006/api2/json",
+            "pve_token_id": "root@pam!yadr01_token",
+            "pve_secret": "другой-уникальный-uuid-тут"
+        }
+    }
+}
