@@ -132,8 +132,12 @@
 
         const pluginBase = '/plugins/prov'
         const api = axios.create({ baseURL: pluginBase })
+        function getAuthToken() {
+            try { return window.parent.localStorage.getItem('token') || '' } catch (_) {}
+            try { return localStorage.getItem('token') || '' } catch (_) { return '' }
+        }
         api.interceptors.request.use(config => {
-            const token = localStorage.getItem('token')
+            const token = getAuthToken()
             if (token) config.headers.Authorization = `Bearer ${token}`
             return config
         })
