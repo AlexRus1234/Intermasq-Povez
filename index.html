@@ -134,7 +134,7 @@
         // Intermasq injects the real plugin path in the base element.
         const baseHref = document.querySelector('base')?.getAttribute('href')
         const pluginBase = baseHref
-            ? new URL(baseHref, window.location.origin).pathname.replace(/\/+$/, '')
+            ? (baseHref.startsWith('/') ? baseHref : new URL(baseHref).pathname).replace(/\/+$/, '')
             : (window.location.protocol === 'blob:' ? '/plugins/prov' : window.location.pathname.replace(/\/+$/, ''))
         const api = axios.create({ baseURL: pluginBase })
         api.interceptors.request.use(config => {
