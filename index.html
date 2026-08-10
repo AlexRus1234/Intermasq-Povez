@@ -130,9 +130,12 @@
     <script>
         const { createApp, ref, onMounted } = Vue
 
-        // document.baseURI remains the plugin URL when Intermasq serves this
-        // page from an authenticated blob iframe.
-        const pluginBase = new URL('.', document.baseURI).pathname.replace(/\/+$/, '')
+        // A blob: document cannot be passed to new URL as a relative base.
+        // Intermasq injects the real plugin path in the base element.
+        const baseHref = document.querySelector('base')?.getAttribute('href')
+        const pluginBase = baseHref
+            ? new URL(baseHref, window.location.origin).pathname.replace(/\/+$/, '')
+            : (window.location.protocol === 'blob:' ? '/plugins/prov' : window.location.pathname.replace(/\/+$/, ''))
         const api = axios.create({ baseURL: pluginBase })
         api.interceptors.request.use(config => {
             const token = localStorage.getItem('token')
