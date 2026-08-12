@@ -87,7 +87,7 @@ func (s *StateStore) Remove(routeID string) error {
 	if err != nil {
 		return err
 	}
-	filtered := records[:0]
+	filtered := make([]RouteRecord, 0, len(records))
 	for _, r := range records {
 		if r.RouteID != routeID {
 			filtered = append(filtered, r)

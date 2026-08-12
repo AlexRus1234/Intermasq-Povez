@@ -1,3 +1,19 @@
+// Povez - Intermasq provisioning plugin
+// Copyright (C) 2026 AlexRus1234
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package core
 
 import (
@@ -5,12 +21,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 )
 
-// Структура конфига одной ноды (из config.json)
+// NodeConfig — конфиг одной ноды из config.json.
 type NodeConfig struct {
 	Subnet     string `json:"subnet"`
 	CaddyURL   string `json:"caddy_url"`
@@ -25,7 +42,7 @@ type PveClient struct {
 }
 
 type ContainerInfo struct {
-	NodeKey  string // Ключ из конфига (например "yadr01") - нужен для поиска Caddy
+	NodeKey  string // Ключ из конфига (например "yadr01") — нужен для поиска Caddy
 	RealNode string // Реальное имя ноды в Proxmox (например "YADR01")
 	VMID     int
 	Name     string
@@ -37,8 +54,7 @@ type ContainerInfo struct {
 
 func NewPveClient(nodes map[string]NodeConfig) *PveClient {
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	// Приводим ключи конфига к нижнему регистру для надежности
-	cleanNodes := make(map[string]NodeConfig)
+	cleanNodes := make(map[string]NodeConfig, len(nodes))
 	for k, v := range nodes {
 		cleanNodes[strings.ToLower(k)] = v
 	}
@@ -48,33 +64,36 @@ func NewPveClient(nodes map[string]NodeConfig) *PveClient {
 	}
 }
 
-// Выполняет запрос к конкретной ноде
+// request выполняет запрос к API конкретной ноды.
 func (p *PveClient) request(conf NodeConfig, method, endpoint string) ([]byte, error) {
 	url := strings.TrimRight(conf.PveURL, "/") + endpoint
-	req, _ := http.NewRequest(method, url, nil)
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
 	req.Header.Set("Authorization", fmt.Sprintf("PVEAPIToken=%s=%s", conf.PveTokenID, conf.PveSecret))
-	
+
 	resp, err := p.client.Do(req)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("pve %s %s: HTTP %d", method, endpoint, resp.StatusCode)
 	}
 	return io.ReadAll(resp.Body)
 }
 
-// ГЛАВНЫЙ ПОИСК
+// FindByMAC ищет контейнер/ВМ по MAC по всем нодам (сначала LXC, потом QEMU).
 func (p *PveClient) FindByMAC(mac string) (*ContainerInfo, error) {
 	mac = strings.ToLower(mac)
-	fmt.Printf("[PROXMOX] Ищем %s по всем нодам...\n", mac)
+	slog.Info("proxmox search by mac", "mac", mac)
 
 	for nodeKey, conf := range p.Nodes {
-		// 1. Ищем в LXC
 		if info, err := p.scanType(nodeKey, conf, "lxc", mac); err == nil {
 			return info, nil
 		}
-		// 2. Ищем в QEMU (ВМ)
 		if info, err := p.scanType(nodeKey, conf, "qemu", mac); err == nil {
 			return info, nil
 		}
@@ -83,63 +102,83 @@ func (p *PveClient) FindByMAC(mac string) (*ContainerInfo, error) {
 }
 
 func (p *PveClient) scanType(nodeKey string, conf NodeConfig, vmType, targetMac string) (*ContainerInfo, error) {
-	// Шаг 1: Получаем список ресурсов, доступных этому токену
-	// Используем /cluster/resources, так как это самый надежный способ узнать ID и реальное имя ноды
+	// /cluster/resources — самый надёжный способ узнать VMID и реальное имя ноды.
 	resBody, err := p.request(conf, "GET", "/cluster/resources")
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 
-	var clusterRes struct { Data []struct { Node string `json:"node"`; Type string `json:"type"`; VMID float64 `json:"vmid"`; Name string `json:"name"`; Status string `json:"status"` } }
-	json.Unmarshal(resBody, &clusterRes)
+	var clusterRes struct {
+		Data []struct {
+			Node   string  `json:"node"`
+			Type   string  `json:"type"`
+			VMID   float64 `json:"vmid"`
+			Name   string  `json:"name"`
+			Status string  `json:"status"`
+		}
+	}
+	if err := json.Unmarshal(resBody, &clusterRes); err != nil {
+		return nil, fmt.Errorf("parse cluster resources: %w", err)
+	}
 
 	for _, item := range clusterRes.Data {
-		if item.Type != vmType { continue }
+		if item.Type != vmType {
+			continue
+		}
 		vmid := int(item.VMID)
 
-		// Шаг 2: Запрашиваем конфиг сети и тегов
-		// Используем item.Node (реальное имя ноды), чтобы API не вернул 596/500
+		// item.Node — реальное имя ноды, иначе API вернёт 596/500.
 		confBody, err := p.request(conf, "GET", fmt.Sprintf("/nodes/%s/%s/%d/config", item.Node, vmType, vmid))
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 
-		var vmConf struct { Data map[string]interface{} `json:"data"` }
-		json.Unmarshal(confBody, &vmConf)
+		var vmConf struct {
+			Data map[string]interface{} `json:"data"`
+		}
+		if err := json.Unmarshal(confBody, &vmConf); err != nil {
+			slog.Warn("parse vm config failed", "vmid", vmid, "node", item.Node, "err", err)
+			continue
+		}
 
-		// Шаг 3: Ищем MAC
+		// Ищем MAC в net*-интерфейсах.
 		found := false
 		for k, v := range vmConf.Data {
 			if strings.HasPrefix(k, "net") && strings.Contains(strings.ToLower(fmt.Sprint(v)), targetMac) {
-				found = true; break
+				found = true
+				break
 			}
 		}
 
 		if found {
-			fmt.Printf("[PROXMOX] Найдено: %s (VMID %d) на ноде %s (Key: %s)\n", item.Name, vmid, item.Node, nodeKey)
-			
+			slog.Info("proxmox container found", "name", item.Name, "vmid", vmid, "node", item.Node, "key", nodeKey)
 			info := &ContainerInfo{
-				NodeKey:  nodeKey,   // Ключ из конфига (yadr01) -> нужен для Caddy URL
-				RealNode: item.Node, // Реальное имя (YADR01) -> нужно для имен файлов
+				NodeKey:  nodeKey,
+				RealNode: item.Node,
 				VMID:     vmid,
 				Name:     item.Name,
 				Status:   item.Status,
-				Protocol: "http", 
-				Port:     "",     
+				Protocol: "http",
 				IsCaddy:  strings.Contains(strings.ToLower(item.Name), "caddy"),
 			}
-
 			if tags, ok := vmConf.Data["tags"].(string); ok {
-				// Заменяем любые разделители на пробелы для парсинга
 				tags = strings.ReplaceAll(tags, ",", " ")
 				tags = strings.ReplaceAll(tags, ";", " ")
-				
 				for _, t := range strings.Fields(tags) {
 					t = strings.ToLower(strings.TrimSpace(t))
-					if strings.HasPrefix(t, "port-") { info.Port = strings.TrimPrefix(t, "port-") }
-					if strings.HasPrefix(t, "proto-") { info.Protocol = strings.TrimPrefix(t, "proto-") }
-					if strings.HasPrefix(t, "name-") { info.Name = strings.TrimPrefix(t, "name-") }
+					switch {
+					case strings.HasPrefix(t, "port-"):
+						info.Port = strings.TrimPrefix(t, "port-")
+					case strings.HasPrefix(t, "proto-"):
+						info.Protocol = strings.TrimPrefix(t, "proto-")
+					case strings.HasPrefix(t, "name-"):
+						info.Name = strings.TrimPrefix(t, "name-")
+					}
 				}
 			}
-			
+
 			if !info.IsCaddy && info.Port == "" {
-				return nil, fmt.Errorf("У контейнера %s нет тега port-XX", item.Name)
+				return nil, fmt.Errorf("у контейнера %s нет тега port-XX", item.Name)
 			}
 			return info, nil
 		}
@@ -147,17 +186,27 @@ func (p *PveClient) scanType(nodeKey string, conf NodeConfig, vmType, targetMac 
 	return nil, fmt.Errorf("not found")
 }
 
+// GetStatus возвращает текущий статус (running/stopped/...) контейнера/ВМ.
 func (p *PveClient) GetStatus(nodeKey string, vmid int) (string, error) {
 	conf, ok := p.Nodes[nodeKey]
-	if !ok { return "", fmt.Errorf("Конфиг ноды %s не найден", nodeKey) }
+	if !ok {
+		return "", fmt.Errorf("config not found for node %q", nodeKey)
+	}
 
-	// Пробуем получить статус как LXC, если ошибка - как QEMU
-	// Нам нужно знать реальное имя ноды. В данном случае мы можем перебрать resources
 	resBody, err := p.request(conf, "GET", "/cluster/resources")
-	if err != nil { return "", err }
-	
-	var clusterRes struct { Data []struct { VMID float64; Status string } }
-	json.Unmarshal(resBody, &clusterRes)
+	if err != nil {
+		return "", err
+	}
+
+	var clusterRes struct {
+		Data []struct {
+			VMID   float64
+			Status string
+		}
+	}
+	if err := json.Unmarshal(resBody, &clusterRes); err != nil {
+		return "", fmt.Errorf("parse cluster resources: %w", err)
+	}
 
 	for _, item := range clusterRes.Data {
 		if int(item.VMID) == vmid {

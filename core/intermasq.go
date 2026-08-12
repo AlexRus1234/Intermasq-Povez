@@ -77,8 +77,11 @@ func (c *IntermasqClient) AddHost(mac, ip, hostname, file string) error {
 	payload := map[string]string{
 		"mac": mac, "ip": ip, "hostname": hostname, "file": file,
 	}
-	data, _ := json.Marshal(payload)
-	_, err := c.doRequest("POST", "/hosts", bytes.NewBuffer(data))
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal host payload: %w", err)
+	}
+	_, err = c.doRequest("POST", "/hosts", bytes.NewBuffer(data))
 	return err
 }
 
@@ -93,7 +96,8 @@ func (c *IntermasqClient) Reload() error {
 	return err
 }
 
-// НОВАЯ ФУНКЦИЯ ДЛЯ УДАЛЕНИЯ ИЗ ДВИЖКА
+// FindFileByMAC ищет dnsmasq-файл, в котором зарегистрирован MAC, перебирая
+// текущий список хостов матери.
 func (c *IntermasqClient) FindFileByMAC(mac string) (string, error) {
 	hosts, err := c.GetHosts()
 	if err != nil { return "", err }
