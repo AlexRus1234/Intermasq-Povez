@@ -26,7 +26,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -159,17 +158,17 @@ func intermasqAPIKey(cfg *Config) string {
 	return cfg.IntermasqKey
 }
 
-// boolOr разрешает nullable bool из config: если p != nil — *p, иначе def.
-// Нужно чтобы отличить явно заданный false от "поле отсутствует" (default true
-// для insecure TLS во внутренней сети).
-func boolOr(def bool, p *bool) bool {
-	if p != nil {
-		return *p
-	}
-	return def
-}
-
 func buildClients(cfg *Config) (*core.PveClient, *core.IntermasqClient, *core.CaddyClient) {
+	// insecureSkipVerify разрешает nullable bool из config: если p != nil — *p,
+	// иначе true. Нужно чтобы отличить явно заданный false от "поле отсутствует"
+	// (default true для insecure TLS во внутренней сети).
+	insecureSkipVerify := func(p *bool) bool {
+		if p != nil {
+			return *p
+		}
+		return true
+	}
+
 	timeout := time.Duration(cfg.HTTP.TimeoutSeconds) * time.Second
 	settle := time.Duration(cfg.Plugin.CertSettleSeconds) * time.Second
 
@@ -177,7 +176,7 @@ func buildClients(cfg *Config) (*core.PveClient, *core.IntermasqClient, *core.Ca
 		PortPrefix:         cfg.Proxmox.PortPrefix,
 		ProtoPrefix:        cfg.Proxmox.ProtoPrefix,
 		NamePrefix:         cfg.Proxmox.NamePrefix,
-		InsecureSkipVerify: boolOr(true, cfg.Proxmox.InsecureSkipVerify),
+		InsecureSkipVerify: insecureSkipVerify(cfg.Proxmox.InsecureSkipVerify),
 		Timeout:            timeout,
 	})
 	imq := core.NewIntermasqClient(cfg.IntermasqURL, intermasqAPIKey(cfg), timeout)
@@ -190,7 +189,7 @@ func buildClients(cfg *Config) (*core.PveClient, *core.IntermasqClient, *core.Ca
 		ACMEURL:          cfg.Caddy.ACMEURL,
 		CARoots:          cfg.Caddy.CARoots,
 		Listen:           cfg.Caddy.Listen,
-		UpstreamInsecure: boolOr(true, cfg.Caddy.UpstreamInsecure),
+		UpstreamInsecure: insecureSkipVerify(cfg.Caddy.UpstreamInsecure),
 		Timeout:          timeout,
 		CertSettleTime:   settle,
 	})
@@ -235,7 +234,11 @@ func buildMux(apiServer *api.ApiServer) *http.ServeMux {
 	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","plugin":"povez","version":%q}`, version)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"plugin":  "povez",
+			"version": version,
+		})
 	})
 
 	mux.HandleFunc("/api/pending", apiServer.HandleGetPending)
@@ -311,7 +314,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	server := &http.Server{Handler: buildMux(api.NewApiServer(engine))}
+	server := &http.Server{
+		Handler:           buildMux(api.NewApiServer(engine)),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	slog.Info("povez starting", "version", version, "state", statePath, "nodes", len(cfg.Nodes))
 	if err := run(server, listener, cleanup); err != nil {

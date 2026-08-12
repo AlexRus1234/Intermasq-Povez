@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -113,7 +114,7 @@ func (c *IntermasqClient) AddHost(mac, ip, hostname, file string) error {
 }
 
 func (c *IntermasqClient) DeleteHost(mac, file string) error {
-	endpoint := fmt.Sprintf("/hosts/%s?file=%s", mac, file)
+	endpoint := fmt.Sprintf("/hosts/%s?file=%s", url.PathEscape(mac), url.QueryEscape(file))
 	_, err := c.doRequest("DELETE", endpoint, nil)
 	return err
 }
@@ -123,8 +124,8 @@ func (c *IntermasqClient) Reload() error {
 	return err
 }
 
-// FindFileByMAC находит dnsmasq-файл хоста по MAC. У матери нет серверного
-// фильтра по MAC, поэтому делаем GET /hosts и сканируем список на клиенте.
+// TODO(server): Intermasq /hosts endpoint should accept a `?mac=XX` filter
+// so we can stop fetching the entire host list on every Deprovision.
 func (c *IntermasqClient) FindFileByMAC(mac string) (string, error) {
 	hosts, err := c.GetHosts()
 	if err != nil {
@@ -141,7 +142,8 @@ func (c *IntermasqClient) FindFileByMAC(mac string) (string, error) {
 		if h.File == "" {
 			continue
 		}
-		// Мать может вернуть file в формате "путь|доп-данные" — берём только путь.
+		// TODO(server): mother should return file as a structured object, not
+		// pipe-delimited string. We take only the path before any `|`.
 		return strings.Split(h.File, "|")[0], nil
 	}
 	return "", fmt.Errorf("host not found by mac %s", mac)
