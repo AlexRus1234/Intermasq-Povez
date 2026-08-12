@@ -80,6 +80,15 @@ type deprovisionRequest struct {
 	MAC string `json:"mac"`
 }
 
+type messageResponse struct {
+	Message string `json:"message"`
+}
+
+type replayResponse struct {
+	OK     int      `json:"ok"`
+	Errors []string `json:"errors"`
+}
+
 func (s *ApiServer) HandleGetPending(w http.ResponseWriter, r *http.Request) {
 	if !allowMethod(w, r, http.MethodGet) {
 		return
@@ -110,7 +119,7 @@ func (s *ApiServer) HandleProvision(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, statusForError(err), err.Error())
 		return
 	}
-	jsonResponse(w, http.StatusOK, map[string]string{"message": resultMsg})
+	jsonResponse(w, http.StatusOK, messageResponse{Message: resultMsg})
 }
 
 func (s *ApiServer) HandleDeprovision(w http.ResponseWriter, r *http.Request) {
@@ -132,7 +141,7 @@ func (s *ApiServer) HandleDeprovision(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, statusForError(err), err.Error())
 		return
 	}
-	jsonResponse(w, http.StatusOK, map[string]string{"message": "Успешно удалено из Dnsmasq и Caddy"})
+	jsonResponse(w, http.StatusOK, messageResponse{Message: "Успешно удалено из Dnsmasq и Caddy"})
 }
 
 func (s *ApiServer) HandleGetState(w http.ResponseWriter, r *http.Request) {
@@ -156,8 +165,8 @@ func (s *ApiServer) HandleReplay(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"ok":     ok,
-		"errors": errs,
-	})
+	if errs == nil {
+		errs = []string{}
+	}
+	jsonResponse(w, http.StatusOK, replayResponse{OK: ok, Errors: errs})
 }

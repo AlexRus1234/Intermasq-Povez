@@ -23,9 +23,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// macRE достаёт MAC из PVE net*-строки вида virtio=AA:..,bridge=vmbr0 или
+// ...hwaddr=AA:.. — игнорирует MAC-подобные значения в bridge/comment.
+var macRE = regexp.MustCompile(`(?i)(?:virtio|hwaddr|mac)=([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})`)
 
 // ProxmoxSettings — конвенция тегов PVE и параметры клиента.
 type ProxmoxSettings struct {
@@ -173,11 +178,20 @@ func (p *PveClient) matchGuest(nodeKey string, conf NodeConfig, realNode, vmType
 		return nil, err
 	}
 
-	// Ищем MAC в net*-интерфейсах.
+	// Ищем MAC в net*-интерфейсах, парся только virtio=/hwaddr=/mac= поля,
+	// чтобы MAC-подобное значение в bridge= или комментарии не давало ложное совпадение.
 	found := false
 	for k, v := range vmConf.Data {
-		if strings.HasPrefix(k, "net") && strings.Contains(strings.ToLower(fmt.Sprint(v)), targetMac) {
-			found = true
+		if !strings.HasPrefix(k, "net") {
+			continue
+		}
+		for _, m := range macRE.FindAllStringSubmatch(fmt.Sprint(v), -1) {
+			if strings.ToLower(m[1]) == targetMac {
+				found = true
+				break
+			}
+		}
+		if found {
 			break
 		}
 	}
@@ -193,7 +207,6 @@ func (p *PveClient) matchGuest(nodeKey string, conf NodeConfig, realNode, vmType
 		Name:     name,
 		Status:   status,
 		Protocol: "http",
-		IsCaddy:  strings.Contains(strings.ToLower(name), "caddy"),
 	}
 	if tags, ok := vmConf.Data["tags"].(string); ok {
 		tags = strings.ReplaceAll(tags, ",", " ")
@@ -201,6 +214,8 @@ func (p *PveClient) matchGuest(nodeKey string, conf NodeConfig, realNode, vmType
 		for _, t := range strings.Fields(tags) {
 			t = strings.ToLower(strings.TrimSpace(t))
 			switch {
+			case t == "caddy":
+				info.IsCaddy = true
 			case strings.HasPrefix(t, p.tags.PortPrefix):
 				info.Port = strings.TrimPrefix(t, p.tags.PortPrefix)
 			case strings.HasPrefix(t, p.tags.ProtoPrefix):
@@ -215,34 +230,4 @@ func (p *PveClient) matchGuest(nodeKey string, conf NodeConfig, realNode, vmType
 		return nil, fmt.Errorf("у контейнера %s нет тега %sXX", name, p.tags.PortPrefix)
 	}
 	return info, nil
-}
-
-// GetStatus возвращает текущий статус (running/stopped/...) контейнера/ВМ.
-func (p *PveClient) GetStatus(nodeKey string, vmid int) (string, error) {
-	conf, ok := p.Nodes[nodeKey]
-	if !ok {
-		return "", fmt.Errorf("config not found for node %q", nodeKey)
-	}
-
-	resBody, err := p.request(conf, "GET", "/cluster/resources")
-	if err != nil {
-		return "", err
-	}
-
-	var clusterRes struct {
-		Data []struct {
-			VMID   float64
-			Status string
-		}
-	}
-	if err := json.Unmarshal(resBody, &clusterRes); err != nil {
-		return "", fmt.Errorf("parse cluster resources: %w", err)
-	}
-
-	for _, item := range clusterRes.Data {
-		if int(item.VMID) == vmid {
-			return item.Status, nil
-		}
-	}
-	return "", fmt.Errorf("VMID %d не найден", vmid)
 }

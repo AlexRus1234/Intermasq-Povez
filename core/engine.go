@@ -17,6 +17,7 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -34,31 +35,29 @@ type EngineSettings struct {
 }
 
 // Engine координирует PVE, Intermasq, Caddy и StateStore для provisioning-а.
-//
-// Соглашение о State (nil-семантика):
-//   - ReplayCaddy требует State и возвращает ошибку при nil.
-//   - Provision/Deprovision опционально пишут в State: при nil запись
-//     молча пропускается (нужно для тестов без реальной ФС).
-//   - GetState при nil возвращает пустой список, а не ошибку.
-//   - В продакшене State всегда не-nil; nil используется только в тестах.
 type Engine struct {
-	PVE      *PveClient
-	IMQ      *IntermasqClient
-	Caddy    *CaddyClient
-	State    *StateStore
-	Domain   string
-	Nodes    map[string]NodeConfig
+	pve      PVEFinder
+	imq      HostManager
+	caddy    RouteManager
+	state    StateBackend
+	domain   string
+	nodes    map[string]NodeConfig
 	settings EngineSettings
 }
 
-func NewEngine(pve *PveClient, imq *IntermasqClient, caddy *CaddyClient, state *StateStore, domain string, nodes map[string]NodeConfig, s EngineSettings) *Engine {
+// NewEngine собирает Engine. state обязателен (nil → panic); pve/imq/caddy
+// могут быть nil для тестов, упражняющих только один клиент.
+func NewEngine(pve PVEFinder, imq HostManager, caddy RouteManager, state StateBackend, domain string, nodes map[string]NodeConfig, s EngineSettings) *Engine {
+	if state == nil {
+		panic("state must not be nil; pass core.NewStateStore(...) or a NoOp implementation")
+	}
 	cleanNodes := make(map[string]NodeConfig, len(nodes))
 	for k, v := range nodes {
 		cleanNodes[strings.ToLower(k)] = v
 	}
 	return &Engine{
-		PVE: pve, IMQ: imq, Caddy: caddy, State: state,
-		Domain: domain, Nodes: cleanNodes, settings: s,
+		pve: pve, imq: imq, caddy: caddy, state: state,
+		domain: domain, nodes: cleanNodes, settings: s,
 	}
 }
 
@@ -68,11 +67,11 @@ type PendingDevice struct {
 }
 
 func (e *Engine) GetPendingDevices() ([]PendingDevice, error) {
-	hosts, err := e.IMQ.GetHosts()
+	hosts, err := e.imq.GetHosts()
 	if err != nil {
 		return nil, fmt.Errorf("get hosts: %w", err)
 	}
-	leases, err := e.IMQ.GetLeases()
+	leases, err := e.imq.GetLeases()
 	if err != nil {
 		return nil, fmt.Errorf("get leases: %w", err)
 	}
@@ -82,7 +81,7 @@ func (e *Engine) GetPendingDevices() ([]PendingDevice, error) {
 		knownMacs[strings.ToLower(h.Mac)] = struct{}{}
 	}
 
-	pending := []PendingDevice{}
+	pending := make([]PendingDevice, 0, len(leases))
 	for _, l := range leases {
 		if _, ok := knownMacs[strings.ToLower(l.Mac)]; !ok {
 			pending = append(pending, PendingDevice{MAC: l.Mac, IP: l.Ip})
@@ -91,16 +90,14 @@ func (e *Engine) GetPendingDevices() ([]PendingDevice, error) {
 	return pending, nil
 }
 
-// makeIDs строит идентификаторы Caddy route и TLS-сертификата по конвенции
-// proxy-<vmid>-<node> / tls-<vmid>-<node>.
+// makeIDs строит route/TLS-идентификаторы по конвенции proxy-<vmid>-<node> / tls-<vmid>-<node>.
 func makeIDs(info *ContainerInfo) (routeID, tlsID string) {
 	routeID = fmt.Sprintf("proxy-%d-%s", info.VMID, info.NodeKey)
 	tlsID = fmt.Sprintf("tls-%d-%s", info.VMID, info.NodeKey)
 	return routeID, tlsID
 }
 
-// computeIP формирует IP контейнера из подсети ноды и смещения VMID.
-// Последний октет = VMID - VMIDBase и обязан лежать в [0, 255].
+// computeIP формирует IP контейнера: последний октет = VMID - VMIDBase в [0,255].
 func (e *Engine) computeIP(info *ContainerInfo, nodeConf NodeConfig) (string, error) {
 	lastOctet := info.VMID - e.settings.VMIDBase
 	if lastOctet < 0 || lastOctet > 255 {
@@ -110,13 +107,14 @@ func (e *Engine) computeIP(info *ContainerInfo, nodeConf NodeConfig) (string, er
 	return fmt.Sprintf("%s.%d", nodeConf.Subnet, lastOctet), nil
 }
 
+// Provision находит контейнер, прописывает DNS и (опционально) Caddy-маршрут.
 func (e *Engine) Provision(mac string, dnsOnly bool) (string, error) {
-	info, err := e.PVE.FindByMAC(mac)
+	info, err := e.pve.FindByMAC(mac)
 	if err != nil {
-		return "", fmt.Errorf("find by mac: %w: %w", ErrContainerNotFound, err)
+		return "", fmt.Errorf("find by mac: %w", errors.Join(ErrContainerNotFound, err))
 	}
 
-	nodeConf, ok := e.Nodes[info.NodeKey]
+	nodeConf, ok := e.nodes[info.NodeKey]
 	if !ok {
 		return "", fmt.Errorf("config not found for node %q", info.NodeKey)
 	}
@@ -136,37 +134,35 @@ func (e *Engine) Provision(mac string, dnsOnly bool) (string, error) {
 	}
 	dnsmasqFile := fmt.Sprintf("%s/%sx%02d.conf", e.settings.DnsmasqDir, strings.ToLower(info.RealNode), subnetOctet)
 
-	domain := fmt.Sprintf("%s.%s%s", strings.ToLower(info.Name), strings.ToLower(info.RealNode), e.Domain)
+	domain := fmt.Sprintf("%s.%s%s", strings.ToLower(info.Name), strings.ToLower(info.RealNode), e.domain)
 	routeID, tlsID := makeIDs(info)
 
 	if info.IsCaddy {
-		if err := e.IMQ.AddHost(mac, newIP, info.Name, e.settings.CaddyFile); err != nil {
+		if err := e.imq.AddHost(mac, newIP, info.Name, e.settings.CaddyFile); err != nil {
 			return "", fmt.Errorf("add caddy host: %w", err)
 		}
 		e.reloadDnsmasq()
 		return "Caddy настроен", nil
 	}
 
-	if err := e.IMQ.AddHost(mac, newIP, info.Name, dnsmasqFile); err != nil {
+	if err := e.imq.AddHost(mac, newIP, info.Name, dnsmasqFile); err != nil {
 		return "", fmt.Errorf("add DNS host: %w", err)
 	}
 
 	if !dnsOnly {
-		if err := e.Caddy.AddRoute(info.NodeKey, domain, newIP, info.Port, info.Protocol, routeID, tlsID); err != nil {
+		if err := e.caddy.AddRoute(info.NodeKey, domain, newIP, info.Port, info.Protocol, routeID, tlsID); err != nil {
 			return "", fmt.Errorf("DNS ok, caddy error: %w", err)
 		}
-		if e.State != nil {
-			if err := e.State.Upsert(RouteRecord{
-				Domain:     domain,
-				TargetIP:   newIP,
-				TargetPort: info.Port,
-				Protocol:   info.Protocol,
-				RouteID:    routeID,
-				TLSID:      tlsID,
-				Node:       info.NodeKey,
-			}); err != nil {
-				slog.Warn("state upsert failed", "route_id", routeID, "err", err)
-			}
+		if err := e.state.Upsert(RouteRecord{
+			Domain:     domain,
+			TargetIP:   newIP,
+			TargetPort: info.Port,
+			Protocol:   info.Protocol,
+			RouteID:    routeID,
+			TLSID:      tlsID,
+			Node:       info.NodeKey,
+		}); err != nil {
+			slog.Warn("state upsert failed", "route_id", routeID, "err", err)
 		}
 	}
 
@@ -174,58 +170,53 @@ func (e *Engine) Provision(mac string, dnsOnly bool) (string, error) {
 	return fmt.Sprintf("Успех! %s -> %s", domain, newIP), nil
 }
 
+// Deprovision удаляет Caddy-маршрут, запись состояния и DNS; ошибки агрегируются.
 func (e *Engine) Deprovision(mac string) error {
-	info, err := e.PVE.FindByMAC(mac)
+	info, err := e.pve.FindByMAC(mac)
 	if err != nil {
-		return fmt.Errorf("find by mac: %w: %w", ErrContainerNotFound, err)
+		return fmt.Errorf("find by mac: %w", errors.Join(ErrContainerNotFound, err))
 	}
 
-	status, err := e.PVE.GetStatus(info.NodeKey, info.VMID)
-	if err != nil {
-		return fmt.Errorf("get container status: %w", err)
-	}
-	if status != "stopped" {
-		return fmt.Errorf("%w: status=%q, stop it first", ErrContainerRunning, status)
+	if info.Status != "stopped" {
+		return fmt.Errorf("%w: status=%q, stop it first", ErrContainerRunning, info.Status)
 	}
 
 	routeID, tlsID := makeIDs(info)
 
-	if err := e.Caddy.DeleteRouteAndTLS(info.NodeKey, routeID, tlsID); err != nil {
-		slog.Warn("caddy delete failed", "mac", mac, "err", err)
+	var errs []error
+	if err := e.caddy.DeleteRouteAndTLS(info.NodeKey, routeID, tlsID); err != nil {
+		errs = append(errs, fmt.Errorf("caddy delete: %w", err))
 	}
-	if e.State != nil {
-		if err := e.State.Remove(routeID); err != nil {
-			slog.Warn("state remove failed", "route_id", routeID, "err", err)
-		}
+	if err := e.state.Remove(routeID); err != nil {
+		errs = append(errs, fmt.Errorf("state remove: %w", err))
 	}
 
-	if fileName, err := e.IMQ.FindFileByMAC(mac); err == nil {
-		if err := e.IMQ.DeleteHost(mac, fileName); err != nil {
-			slog.Warn("delete host failed", "mac", mac, "err", err)
+	if fileName, err := e.imq.FindFileByMAC(mac); err == nil {
+		if err := e.imq.DeleteHost(mac, fileName); err != nil {
+			errs = append(errs, fmt.Errorf("dns delete: %w", err))
 		}
 	} else {
 		slog.Warn("host file not found for mac", "mac", mac, "err", err)
 	}
 
 	e.reloadDnsmasq()
+
+	if len(errs) > 0 {
+		return fmt.Errorf("deprovision completed with errors: %w", errors.Join(errs...))
+	}
 	return nil
 }
 
-// reloadDnsmasq перезагружает конфиг матери; ошибка логируется, но не валит
-// операцию (dnsmasq перечитает конфиг при следующем reload/рестарте).
+// reloadDnsmasq перезагружает конфиг матери; ошибка логируется (best-effort).
 func (e *Engine) reloadDnsmasq() {
-	if err := e.IMQ.Reload(); err != nil {
+	if err := e.imq.Reload(); err != nil {
 		slog.Warn("dnsmasq reload failed", "err", err)
 	}
 }
 
-// ReplayCaddy перезаписывает конфиг Caddy из файла-таблицы (восстановление
-// после сброса). Возвращает количество восстановленных записей и список ошибок.
+// ReplayCaddy восстанавливает конфиг Caddy из State и перезапускает ноды.
 func (e *Engine) ReplayCaddy() (int, []string, error) {
-	if e.State == nil {
-		return 0, nil, fmt.Errorf("state store not initialized")
-	}
-	records, err := e.State.Load()
+	records, err := e.state.Load()
 	if err != nil {
 		return 0, nil, err
 	}
@@ -236,21 +227,29 @@ func (e *Engine) ReplayCaddy() (int, []string, error) {
 	ok := 0
 	var errs []string
 	touchedNodes := make(map[string]struct{})
+	domainByNode := make(map[string]string)
 
 	for _, rec := range records {
-		if err := e.Caddy.ReplayRoute(rec.Node, rec.Domain, rec.TargetIP, rec.TargetPort, rec.Protocol, rec.RouteID, rec.TLSID); err != nil {
+		if err := e.caddy.ReplayRoute(rec.Node, rec.Domain, rec.TargetIP, rec.TargetPort, rec.Protocol, rec.RouteID, rec.TLSID); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", rec.Domain, err))
 			continue
 		}
 		ok++
 		touchedNodes[rec.Node] = struct{}{}
+		domainByNode[rec.Node] = rec.Domain
 	}
 
-	// Один финальный /stop на каждую затронутую ноду — сброс cert cache.
-	// Сначала ждём выпуска сертификатов, потом перезапускаем.
-	time.Sleep(e.settings.CertSettle)
+	// Финальный рестарт на каждую затронутую ноду — сброс cert cache.
+	// Сначала ждём выпуска сертификата, потом перезапускаем.
+	maxWait := e.settings.CertSettle * 15
+	if maxWait < 5*time.Second {
+		maxWait = 30 * time.Second
+	}
 	for node := range touchedNodes {
-		if err := e.Caddy.RestartCaddy(node); err != nil {
+		if err := e.caddy.WaitForCert(node, domainByNode[node], maxWait); err != nil {
+			slog.Warn("cert poll failed, restarting anyway", "node", node, "err", err)
+		}
+		if err := e.caddy.RestartCaddy(node); err != nil {
 			errs = append(errs, fmt.Sprintf("restart %s: %v", node, err))
 		}
 	}
@@ -260,8 +259,5 @@ func (e *Engine) ReplayCaddy() (int, []string, error) {
 
 // GetState отдаёт содержимое файла-таблицы для UI.
 func (e *Engine) GetState() ([]RouteRecord, error) {
-	if e.State == nil {
-		return []RouteRecord{}, nil
-	}
-	return e.State.Load()
+	return e.state.Load()
 }

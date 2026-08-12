@@ -17,6 +17,16 @@
 package core
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"fmt"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -27,32 +37,25 @@ func TestCaddyClient_GenerateRouteJSON_HTTP(t *testing.T) {
 	c := NewCaddyClient(nil, CaddySettings{UpstreamInsecure: true})
 	r := c.generateRouteJSON("a.test", "10.0.0.1", "8080", "http", "proxy-1")
 
-	if r["@id"] != "proxy-1" {
-		t.Errorf("@id = %v, want proxy-1", r["@id"])
+	if r.ID != "proxy-1" {
+		t.Errorf("@id = %v, want proxy-1", r.ID)
 	}
-	match, ok := r["match"].([]interface{})
-	if !ok || len(match) != 1 {
-		t.Fatalf("match shape unexpected: %#v", r["match"])
+	if len(r.Match) != 1 || len(r.Match[0].Host) != 1 || r.Match[0].Host[0] != "a.test" {
+		t.Errorf("host = %v, want [a.test]", r.Match)
 	}
-	m := match[0].(map[string]interface{})
-	hosts, _ := m["host"].([]string)
-	if len(hosts) != 1 || hosts[0] != "a.test" {
-		t.Errorf("host = %v, want [a.test]", hosts)
+	if len(r.Handle) != 1 {
+		t.Fatalf("handle shape unexpected: %#v", r.Handle)
 	}
-
-	handle := r["handle"].([]interface{})[0].(map[string]interface{})
-	if handle["handler"] != "reverse_proxy" {
-		t.Errorf("handler = %v, want reverse_proxy", handle["handler"])
+	h := r.Handle[0]
+	if h.Handler != "reverse_proxy" {
+		t.Errorf("handler = %v, want reverse_proxy", h.Handler)
 	}
-	upstreams := handle["upstreams"].([]interface{})
-	up := upstreams[0].(map[string]interface{})
-	if up["dial"] != "10.0.0.1:8080" {
-		t.Errorf("dial = %v, want 10.0.0.1:8080", up["dial"])
+	if len(h.Upstreams) != 1 || h.Upstreams[0].Dial != "10.0.0.1:8080" {
+		t.Errorf("dial = %v, want 10.0.0.1:8080", h.Upstreams)
 	}
 	// http → no transport.tls
-	tr := handle["transport"].(map[string]interface{})
-	if _, hasTLS := tr["tls"]; hasTLS {
-		t.Errorf("http route must not set transport.tls, got %#v", tr["tls"])
+	if h.Transport.TLS != nil {
+		t.Errorf("http route must not set transport.tls, got %#v", h.Transport.TLS)
 	}
 }
 
@@ -60,24 +63,39 @@ func TestCaddyClient_GenerateRouteJSON_HTTPSInsecureFromSettings(t *testing.T) {
 	// UpstreamInsecure=true → tls.insecure_skip_verify=true
 	c := NewCaddyClient(nil, CaddySettings{UpstreamInsecure: true})
 	r := c.generateRouteJSON("a.test", "10.0.0.1", "8443", "https", "proxy-1")
-	handle := r["handle"].([]interface{})[0].(map[string]interface{})
-	tr := handle["transport"].(map[string]interface{})
-	tls, ok := tr["tls"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("https route must set transport.tls, got %#v", tr["tls"])
+	tlsCfg := r.Handle[0].Transport.TLS
+	if tlsCfg == nil {
+		t.Fatalf("https route must set transport.tls, got nil")
 	}
-	if tls["insecure_skip_verify"] != true {
-		t.Errorf("insecure_skip_verify = %v, want true", tls["insecure_skip_verify"])
+	if !tlsCfg.InsecureSkipVerify {
+		t.Errorf("insecure_skip_verify = %v, want true", tlsCfg.InsecureSkipVerify)
 	}
 
 	// UpstreamInsecure=false → tls.insecure_skip_verify=false (config-driven)
 	c2 := NewCaddyClient(nil, CaddySettings{UpstreamInsecure: false})
 	r2 := c2.generateRouteJSON("a.test", "10.0.0.1", "8443", "https", "proxy-1")
-	handle2 := r2["handle"].([]interface{})[0].(map[string]interface{})
-	tr2 := handle2["transport"].(map[string]interface{})
-	tls2 := tr2["tls"].(map[string]interface{})
-	if tls2["insecure_skip_verify"] != false {
-		t.Errorf("insecure_skip_verify = %v, want false (from settings)", tls2["insecure_skip_verify"])
+	tlsCfg2 := r2.Handle[0].Transport.TLS
+	if tlsCfg2 == nil {
+		t.Fatalf("https route must set transport.tls, got nil")
+	}
+	if tlsCfg2.InsecureSkipVerify {
+		t.Errorf("insecure_skip_verify = %v, want false (from settings)", tlsCfg2.InsecureSkipVerify)
+	}
+}
+
+// TestCaddyClient_GenerateRouteJSON_ByteIdentical guards that the typed structs
+// marshal to exactly the same bytes the old map[string]interface{} produced.
+func TestCaddyClient_GenerateRouteJSON_ByteIdentical(t *testing.T) {
+	c := NewCaddyClient(nil, CaddySettings{UpstreamInsecure: true})
+
+	httpWant := `{"@id":"proxy-1","handle":[{"handler":"reverse_proxy","transport":{"protocol":"http"},"upstreams":[{"dial":"10.0.0.1:8080"}]}],"match":[{"host":["a.test"]}]}`
+	if b, _ := json.Marshal(c.generateRouteJSON("a.test", "10.0.0.1", "8080", "http", "proxy-1")); string(b) != httpWant {
+		t.Errorf("http route JSON mismatch:\n got: %s\nwant: %s", b, httpWant)
+	}
+
+	httpsWant := `{"@id":"proxy-1","handle":[{"handler":"reverse_proxy","transport":{"protocol":"http","tls":{"insecure_skip_verify":true}},"upstreams":[{"dial":"10.0.0.1:8443"}]}],"match":[{"host":["a.test"]}]}`
+	if b, _ := json.Marshal(c.generateRouteJSON("a.test", "10.0.0.1", "8443", "https", "proxy-1")); string(b) != httpsWant {
+		t.Errorf("https route JSON mismatch:\n got: %s\nwant: %s", b, httpsWant)
 	}
 }
 
@@ -89,29 +107,38 @@ func TestCaddyClient_GenerateTLSPolicy(t *testing.T) {
 	})
 	p := c.generateTLSPolicy("a.test", "tls-1")
 
-	if p["@id"] != "tls-1" {
-		t.Errorf("@id = %v, want tls-1", p["@id"])
+	if p.ID != "tls-1" {
+		t.Errorf("@id = %v, want tls-1", p.ID)
 	}
-	subjects, _ := p["subjects"].([]string)
-	if len(subjects) != 1 || subjects[0] != "a.test" {
-		t.Errorf("subjects = %v, want [a.test]", subjects)
+	if len(p.Subjects) != 1 || p.Subjects[0] != "a.test" {
+		t.Errorf("subjects = %v, want [a.test]", p.Subjects)
 	}
-	issuers, _ := p["issuers"].([]map[string]interface{})
-	if len(issuers) != 1 {
-		t.Fatalf("expected 1 issuer, got %d", len(issuers))
+	if len(p.Issuers) != 1 {
+		t.Fatalf("expected 1 issuer, got %d", len(p.Issuers))
 	}
-	if issuers[0]["ca"] != "https://acme.test/dir" {
-		t.Errorf("ca = %v, want acme.test/dir", issuers[0]["ca"])
+	iss := p.Issuers[0]
+	if iss.CA != "https://acme.test/dir" {
+		t.Errorf("ca = %v, want https://acme.test/dir", iss.CA)
 	}
-	roots, _ := issuers[0]["trusted_roots_pem_files"].([]string)
-	if len(roots) != 1 || roots[0] != "/path/ca.pem" {
-		t.Errorf("trusted_roots = %v, want [/path/ca.pem]", roots)
+	if len(iss.TrustedRootsPEMFiles) != 1 || iss.TrustedRootsPEMFiles[0] != "/path/ca.pem" {
+		t.Errorf("trusted_roots = %v, want [/path/ca.pem]", iss.TrustedRootsPEMFiles)
 	}
 	// HTTP-01 challenge must be disabled (Step-CA serves DNS/TLS-ALPN only).
-	ch := issuers[0]["challenges"].(map[string]interface{})
-	httpCh := ch["http"].(map[string]interface{})
-	if httpCh["disabled"] != true {
-		t.Errorf("http challenge not disabled: %#v", httpCh)
+	if !iss.Challenges.HTTP.Disabled {
+		t.Errorf("http challenge not disabled: %#v", iss.Challenges.HTTP)
+	}
+}
+
+// TestCaddyClient_GenerateTLSPolicy_ByteIdentical guards the typed struct's
+// marshalled output against the old map-based byte sequence.
+func TestCaddyClient_GenerateTLSPolicy_ByteIdentical(t *testing.T) {
+	c := NewCaddyClient(nil, CaddySettings{
+		ACMEURL: "https://acme.test/dir",
+		CARoots: "/path/ca.pem",
+	})
+	want := `{"@id":"tls-1","issuers":[{"ca":"https://acme.test/dir","challenges":{"http":{"disabled":true}},"module":"acme","trusted_roots_pem_files":["/path/ca.pem"]}],"subjects":["a.test"]}`
+	if b, _ := json.Marshal(c.generateTLSPolicy("a.test", "tls-1")); string(b) != want {
+		t.Errorf("tls policy JSON mismatch:\n got: %s\nwant: %s", b, want)
 	}
 }
 
@@ -342,5 +369,79 @@ func TestCaddyClient_InitSrv0_DoesNotClobberExisting(t *testing.T) {
 	}
 	if postCount != 1 {
 		t.Errorf("expected exactly one POST (no init retry), got %d", postCount)
+	}
+}
+
+// selfSignedCert builds an ECDSA self-signed certificate valid for domain,
+// suitable for a *tls.Config passed to an httptest TLS server.
+func selfSignedCert(t *testing.T, domain string) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: domain},
+		DNSNames:     []string{domain},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+func TestCaddyClient_WaitForCert_Success(t *testing.T) {
+	domain := "acme.test"
+	cert := selfSignedCert(t, domain)
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	tcpAddr := srv.Listener.Addr().(*net.TCPAddr)
+	port := fmt.Sprintf("%d", tcpAddr.Port)
+
+	// Non-existent CARoots forces the insecure-skip-verify + leaf-subject path.
+	c := NewCaddyClient(map[string]string{"node": fmt.Sprintf("http://127.0.0.1:%s", port)}, CaddySettings{
+		Listen:  ":" + port,
+		CARoots: "/nonexistent/ca.pem",
+	})
+	if err := c.WaitForCert("node", domain, 3*time.Second); err != nil {
+		t.Fatalf("WaitForCert: %v", err)
+	}
+}
+
+func TestCaddyClient_WaitForCert_Timeout(t *testing.T) {
+	// Listen then immediately close: every dial refuses → poll loop exhausts.
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	tcpAddr := srv.Listener.Addr().(*net.TCPAddr)
+	port := fmt.Sprintf("%d", tcpAddr.Port)
+	srv.Close()
+
+	c := NewCaddyClient(map[string]string{"node": fmt.Sprintf("http://127.0.0.1:%s", port)}, CaddySettings{
+		Listen:  ":" + port,
+		CARoots: "/nonexistent/ca.pem",
+	})
+	if err := c.WaitForCert("node", "nope.test", 1200*time.Millisecond); err == nil {
+		t.Fatalf("expected timeout error, got nil")
+	}
+}
+
+// TestCaddyClient_RestartCaddy_IgnoresTransportErrors: with nothing listening,
+// POST /stop fails to connect; RestartCaddy must swallow that and return nil.
+func TestCaddyClient_RestartCaddy_IgnoresTransportErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	addr := srv.URL
+	srv.Close()
+
+	c := NewCaddyClient(map[string]string{"node": addr}, CaddySettings{Timeout: time.Second})
+	if err := c.RestartCaddy("node"); err != nil {
+		t.Errorf("RestartCaddy should ignore /stop transport errors, got: %v", err)
 	}
 }
