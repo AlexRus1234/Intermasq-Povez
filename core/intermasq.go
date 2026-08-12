@@ -1,3 +1,19 @@
+// Povez - Intermasq provisioning plugin
+// Copyright (C) 2026 AlexRus1234
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package core
 
 import (
@@ -29,11 +45,14 @@ type LeaseEntry struct {
 	Hostname string `json:"hostname"`
 }
 
-func NewIntermasqClient(url, apiKey string) *IntermasqClient {
+func NewIntermasqClient(url, apiKey string, timeout time.Duration) *IntermasqClient {
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
 	return &IntermasqClient{
 		BaseURL: strings.TrimRight(url, "/"),
 		ApiKey:  apiKey,
-		client:  &http.Client{Timeout: 10 * time.Second},
+		client:  &http.Client{Timeout: timeout},
 	}
 }
 
@@ -50,13 +69,13 @@ func (c *IntermasqClient) doRequest(method, endpoint string, body io.Reader) ([]
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("Intermasq connection error: %w", err)
+		return nil, fmt.Errorf("intermasq connection error: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Intermasq API error (%d): %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("intermasq API error (%d): %s", resp.StatusCode, string(respBody))
 	}
 	return io.ReadAll(resp.Body)
 }

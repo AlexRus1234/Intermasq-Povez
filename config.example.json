@@ -10,13 +10,29 @@
             "pve_url": "https://127.0.0.1:8006/api2/json",
             "pve_token_id": "user@pam!token_name",
             "pve_secret": "REPLACE_WITH_PVE_API_TOKEN_SECRET"
-        },
-        "node01": {
-            "subnet": "172.20.6",
-            "caddy_url": "http://127.0.0.1:2019",
-            "pve_url": "https://127.0.0.1:8006/api2/json",
-            "pve_token_id": "user@pam!token_name",
-            "pve_secret": "REPLACE_WITH_PVE_API_TOKEN_SECRET"
         }
+    },
+
+    "caddy": {
+        "acme_url": "https://172.20.0.1:9000/acme/acme/directory",
+        "ca_roots": "/etc/caddy/root_ca.crt",
+        "listen": ":443"
+    },
+    "dnsmasq": {
+        "conf_dir": "/etc/dnsmasq.d",
+        "caddy_file": "/etc/dnsmasq.d/caddy.conf"
+    },
+    "http": {
+        "timeout_seconds": 10
+    },
+    "proxmox": {
+        "port_prefix": "port-",
+        "proto_prefix": "proto-",
+        "name_prefix": "name-",
+        "vmid_base": 98
+    },
+    "plugin": {
+        "tcp_debug_port": ":5000",
+        "cert_settle_seconds": 2
     }
 }

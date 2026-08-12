@@ -27,21 +27,34 @@ import (
 	"time"
 )
 
+// CaddySettings — параметры Caddy-клиента (ACME, CA, порт, таймауты).
+type CaddySettings struct {
+	ACMEURL        string        // Step-CA ACME directory URL
+	CARoots        string        // путь к root CA PEM
+	Listen         string        // порт Caddy (":443")
+	Timeout        time.Duration // таймаут HTTP-клиента
+	CertSettleTime time.Duration // пауза перед /stop (выпуск cert)
+}
+
 type CaddyClient struct {
 	BaseURLs map[string]string
+	settings CaddySettings
 	client   *http.Client
 }
 
-// NewCaddyClient нормализует ключи нод к нижнему регистру единожды, чтобы
-// не приводить их при каждом lookup.
-func NewCaddyClient(urls map[string]string) *CaddyClient {
+// NewCaddyClient нормализует ключи нод к нижнему регистру единожды.
+func NewCaddyClient(urls map[string]string, s CaddySettings) *CaddyClient {
 	clean := make(map[string]string, len(urls))
 	for k, v := range urls {
 		clean[strings.ToLower(k)] = strings.TrimRight(v, "/")
 	}
+	if s.Timeout == 0 {
+		s.Timeout = 10 * time.Second
+	}
 	return &CaddyClient{
 		BaseURLs: clean,
-		client:   &http.Client{Timeout: 10 * time.Second},
+		settings: s,
+		client:   &http.Client{Timeout: s.Timeout},
 	}
 }
 
@@ -89,17 +102,18 @@ func GenerateRouteJSON(domain, targetIP, targetPort, protocol, routeID string) m
 	}
 }
 
-// GenerateTLSPolicyJSON формирует политику TLS: HTTP-01 челлендж отключён,
-// сертификат выпускается через Step-CA ACME.
-func GenerateTLSPolicyJSON(domain, tlsID string) map[string]interface{} {
+// generateTLSPolicy формирует политику TLS: HTTP-01 челлендж отключён,
+// сертификат выпускается через Step-CA ACME. Метод — использует настройки
+// клиента (ACME URL, CA roots) из CaddySettings.
+func (c *CaddyClient) generateTLSPolicy(domain, tlsID string) map[string]interface{} {
 	return map[string]interface{}{
 		"@id":      tlsID,
 		"subjects": []string{domain},
 		"issuers": []map[string]interface{}{
 			{
 				"module":                  "acme",
-				"ca":                      "https://172.20.0.1:9000/acme/acme/directory",
-				"trusted_roots_pem_files": []string{"/etc/caddy/root_ca.crt"},
+				"ca":                      c.settings.ACMEURL,
+				"trusted_roots_pem_files": []string{c.settings.CARoots},
 				"challenges": map[string]interface{}{
 					"http": map[string]interface{}{"disabled": true},
 				},
@@ -211,7 +225,7 @@ func (c *CaddyClient) initTLSParent(baseURL string, tlsPolicy map[string]interfa
 // initSrv0 создаёт HTTP-сервер srv0, если его нет.
 func (c *CaddyClient) initSrv0(baseURL string, routeConfig map[string]interface{}) error {
 	resp, err := c.doJSON("PUT", baseURL+"/config/apps/http/servers/srv0", map[string]interface{}{
-		"listen": []string{":443"},
+		"listen": []string{c.settings.Listen},
 		"routes": []interface{}{routeConfig},
 	})
 	if err != nil {
@@ -231,7 +245,7 @@ func (c *CaddyClient) installRouteAndCert(nodeName, domain, targetIP, targetPort
 		return err
 	}
 
-	tlsPolicy := GenerateTLSPolicyJSON(domain, tlsID)
+	tlsPolicy := c.generateTLSPolicy(domain, tlsID)
 	initTLS := func() error { return c.initTLSParent(baseURL, tlsPolicy) }
 	if err := c.upsertByID(baseURL, tlsID, "/config/apps/tls/automation/policies", tlsPolicy, initTLS); err != nil {
 		return fmt.Errorf("tls policy: %w", err)
@@ -270,8 +284,8 @@ func (c *CaddyClient) AddRoute(nodeName, domain, targetIP, targetPort, protocol,
 	// Ждём, пока Caddy запишет свежий сертификат Step-CA на диск, затем
 	// убиваем процесс — systemd поднимет его, и при старте cert загрузится
 	// с диска, минуя плохой кэш.
-	slog.Info("caddy route installed, waiting before restart", "domain", domain)
-	time.Sleep(2 * time.Second)
+	slog.Info("caddy route installed, waiting before restart", "domain", domain, "settle", c.settings.CertSettleTime)
+	time.Sleep(c.settings.CertSettleTime)
 	if err := c.RestartCaddy(nodeName); err != nil {
 		return fmt.Errorf("restart: %w", err)
 	}

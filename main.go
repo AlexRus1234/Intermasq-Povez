@@ -41,12 +41,52 @@ import (
 // version вшивается через -ldflags "-X main.version=..." в CI.
 var version = "dev"
 
-// Config читается из config.json. NodeConfig определён в пакете core.
+// Config читается из config.json. Опциональные секции (caddy/dnsmasq/http/
+// proxmox/plugin) имеют разумные дефолты в applyDefaults — в config.json их
+// можно не указывать. NodeConfig определён в пакете core.
 type Config struct {
 	IntermasqURL string                     `json:"intermasq_url"`
 	IntermasqKey string                     `json:"intermasq_key"`
 	BaseDomain   string                     `json:"base_domain"`
 	Nodes        map[string]core.NodeConfig `json:"nodes"`
+
+	Caddy   CaddyConfig   `json:"caddy"`
+	Dnsmasq DnsmasqConfig `json:"dnsmasq"`
+	HTTP    HTTPConfig    `json:"http"`
+	Proxmox ProxmoxConfig `json:"proxmox"`
+	Plugin  PluginConfig  `json:"plugin"`
+}
+
+// CaddyConfig — параметры TLS/reverse-proxy в Caddy.
+type CaddyConfig struct {
+	ACMEURL string `json:"acme_url"` // Step-CA ACME directory URL
+	CARoots string `json:"ca_roots"` // путь к root CA PEM для Step-CA
+	Listen  string `json:"listen"`   // порт, который слушает Caddy (":443")
+}
+
+// DnsmasqConfig — расположение конфигов dnsmasq, куда плагин пишет host-записи.
+type DnsmasqConfig struct {
+	ConfDir   string `json:"conf_dir"`   // каталог include-файлов dnsmasq
+	CaddyFile string `json:"caddy_file"` // файл хоста Caddy внутри матери
+}
+
+// HTTPConfig — общий таймаут HTTP-клиентов (PVE/Intermasq/Caddy).
+type HTTPConfig struct {
+	TimeoutSeconds int `json:"timeout_seconds"`
+}
+
+// ProxmoxConfig — конвенция тегов PVE и формула IP-адресации.
+type ProxmoxConfig struct {
+	PortPrefix  string `json:"port_prefix"`
+	ProtoPrefix string `json:"proto_prefix"`
+	NamePrefix  string `json:"name_prefix"`
+	VMIDBase    int    `json:"vmid_base"` // базовый VMID для расчёта IP-суффикса
+}
+
+// PluginConfig — параметры запуска плагина.
+type PluginConfig struct {
+	TCPDebugPort      string `json:"tcp_debug_port"`      // TCP-порт локальной отладки (без матери)
+	CertSettleSeconds int    `json:"cert_settle_seconds"` // пауза перед рестартом Caddy (выпуск cert)
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -58,7 +98,49 @@ func loadConfig(path string) (*Config, error) {
 	if err := json.Unmarshal(file, &cfg); err != nil {
 		return nil, err
 	}
+	cfg.applyDefaults()
 	return &cfg, nil
+}
+
+// applyDefaults заполняет пустые опциональные поля разумными значениями,
+// чтобы config.json мог содержать только обязательные intermasq_url/nodes.
+func (c *Config) applyDefaults() {
+	if c.Caddy.ACMEURL == "" {
+		c.Caddy.ACMEURL = "https://172.20.0.1:9000/acme/acme/directory"
+	}
+	if c.Caddy.CARoots == "" {
+		c.Caddy.CARoots = "/etc/caddy/root_ca.crt"
+	}
+	if c.Caddy.Listen == "" {
+		c.Caddy.Listen = ":443"
+	}
+	if c.Dnsmasq.ConfDir == "" {
+		c.Dnsmasq.ConfDir = "/etc/dnsmasq.d"
+	}
+	if c.Dnsmasq.CaddyFile == "" {
+		c.Dnsmasq.CaddyFile = "/etc/dnsmasq.d/caddy.conf"
+	}
+	if c.HTTP.TimeoutSeconds == 0 {
+		c.HTTP.TimeoutSeconds = 10
+	}
+	if c.Proxmox.PortPrefix == "" {
+		c.Proxmox.PortPrefix = "port-"
+	}
+	if c.Proxmox.ProtoPrefix == "" {
+		c.Proxmox.ProtoPrefix = "proto-"
+	}
+	if c.Proxmox.NamePrefix == "" {
+		c.Proxmox.NamePrefix = "name-"
+	}
+	if c.Proxmox.VMIDBase == 0 {
+		c.Proxmox.VMIDBase = 98
+	}
+	if c.Plugin.TCPDebugPort == "" {
+		c.Plugin.TCPDebugPort = ":5000"
+	}
+	if c.Plugin.CertSettleSeconds == 0 {
+		c.Plugin.CertSettleSeconds = 2
+	}
 }
 
 // intermasqAPIKey отдаёт API-ключ для обратных вызовов в мать. Приоритет —
@@ -72,23 +154,39 @@ func intermasqAPIKey(cfg *Config) string {
 }
 
 func buildClients(cfg *Config) (*core.PveClient, *core.IntermasqClient, *core.CaddyClient) {
-	pve := core.NewPveClient(cfg.Nodes)
-	imq := core.NewIntermasqClient(cfg.IntermasqURL, intermasqAPIKey(cfg))
+	timeout := time.Duration(cfg.HTTP.TimeoutSeconds) * time.Second
+	settle := time.Duration(cfg.Plugin.CertSettleSeconds) * time.Second
+
+	pve := core.NewPveClient(cfg.Nodes, core.ProxmoxSettings{
+		PortPrefix:  cfg.Proxmox.PortPrefix,
+		ProtoPrefix: cfg.Proxmox.ProtoPrefix,
+		NamePrefix:  cfg.Proxmox.NamePrefix,
+		Timeout:     timeout,
+	})
+	imq := core.NewIntermasqClient(cfg.IntermasqURL, intermasqAPIKey(cfg), timeout)
+
 	caddyURLs := make(map[string]string, len(cfg.Nodes))
 	for name, data := range cfg.Nodes {
 		caddyURLs[name] = data.CaddyURL
 	}
-	return pve, imq, core.NewCaddyClient(caddyURLs)
+	caddy := core.NewCaddyClient(caddyURLs, core.CaddySettings{
+		ACMEURL:        cfg.Caddy.ACMEURL,
+		CARoots:        cfg.Caddy.CARoots,
+		Listen:         cfg.Caddy.Listen,
+		Timeout:        timeout,
+		CertSettleTime: settle,
+	})
+	return pve, imq, caddy
 }
 
 // newListener выбирает транспорт: если задан PLUGIN_SOCKET — unix-сокет
-// (контракт Intermasq), иначе TCP :5000 (только локальная отладка).
+// (контракт Intermasq), иначе TCP tcpPort (только локальная отладка).
 // Возвращает listener, функцию очистки socket-файла и ошибку.
-func newListener() (net.Listener, func(), error) {
+func newListener(tcpPort string) (net.Listener, func(), error) {
 	socketPath := os.Getenv("PLUGIN_SOCKET")
 	if socketPath == "" {
-		l, err := net.Listen("tcp", ":5000")
-		slog.Info("plugin started on TCP :5000 (debug mode)")
+		l, err := net.Listen("tcp", tcpPort)
+		slog.Info("plugin started on TCP (debug mode)", "addr", tcpPort)
 		return l, func() {}, err
 	}
 
@@ -164,9 +262,13 @@ func run(server *http.Server, listener net.Listener, cleanup func()) error {
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	cfg, err := loadConfig("config.json")
+	configPath := os.Getenv("CONFIG_PATH")
+	if configPath == "" {
+		configPath = "config.json"
+	}
+	cfg, err := loadConfig(configPath)
 	if err != nil {
-		slog.Error("config load failed", "err", err)
+		slog.Error("config load failed", "path", configPath, "err", err)
 		os.Exit(1)
 	}
 
@@ -177,9 +279,14 @@ func main() {
 		statePath = "/etc/intermasq/plugins/povez/routes.json"
 	}
 	state := core.NewStateStore(statePath)
-	engine := core.NewEngine(pve, imq, caddy, state, cfg.BaseDomain, cfg.Nodes)
+	engine := core.NewEngine(pve, imq, caddy, state, cfg.BaseDomain, cfg.Nodes, core.EngineSettings{
+		DnsmasqDir: cfg.Dnsmasq.ConfDir,
+		CaddyFile:  cfg.Dnsmasq.CaddyFile,
+		VMIDBase:   cfg.Proxmox.VMIDBase,
+		CertSettle: time.Duration(cfg.Plugin.CertSettleSeconds) * time.Second,
+	})
 
-	listener, cleanup, err := newListener()
+	listener, cleanup, err := newListener(cfg.Plugin.TCPDebugPort)
 	if err != nil {
 		slog.Error("listener failed", "err", err)
 		os.Exit(1)

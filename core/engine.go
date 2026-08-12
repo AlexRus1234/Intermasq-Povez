@@ -24,23 +24,33 @@ import (
 	"time"
 )
 
-type Engine struct {
-	PVE    *PveClient
-	IMQ    *IntermasqClient
-	Caddy  *CaddyClient
-	State  *StateStore
-	Domain string
-	Nodes  map[string]NodeConfig
+// EngineSettings — параметры оркестратора (расположение dnsmasq, формула IP,
+// пауза перед рестартом Caddy).
+type EngineSettings struct {
+	DnsmasqDir string        // каталог include-файлов dnsmasq
+	CaddyFile  string        // файл хоста Caddy внутри матери
+	VMIDBase   int           // базовый VMID для расчёта IP-суффикса
+	CertSettle time.Duration // пауза перед финальным /stop в ReplayCaddy
 }
 
-func NewEngine(pve *PveClient, imq *IntermasqClient, caddy *CaddyClient, state *StateStore, domain string, nodes map[string]NodeConfig) *Engine {
+type Engine struct {
+	PVE      *PveClient
+	IMQ      *IntermasqClient
+	Caddy    *CaddyClient
+	State    *StateStore
+	Domain   string
+	Nodes    map[string]NodeConfig
+	settings EngineSettings
+}
+
+func NewEngine(pve *PveClient, imq *IntermasqClient, caddy *CaddyClient, state *StateStore, domain string, nodes map[string]NodeConfig, s EngineSettings) *Engine {
 	cleanNodes := make(map[string]NodeConfig, len(nodes))
 	for k, v := range nodes {
 		cleanNodes[strings.ToLower(k)] = v
 	}
 	return &Engine{
 		PVE: pve, IMQ: imq, Caddy: caddy, State: state,
-		Domain: domain, Nodes: cleanNodes,
+		Domain: domain, Nodes: cleanNodes, settings: s,
 	}
 }
 
@@ -73,11 +83,6 @@ func (e *Engine) GetPendingDevices() ([]PendingDevice, error) {
 	return pending, nil
 }
 
-// vmidBase — базовый VMID, от которого считается IP-суффикс контейнера
-// (VMID 99 → суффикс 1, 100 → 2, ...).
-// TODO(eta3): вынести в конфиг ноды.
-const vmidBase = 98
-
 func (e *Engine) Provision(mac string, dnsOnly bool) (string, error) {
 	info, err := e.PVE.FindByMAC(mac)
 	if err != nil {
@@ -89,7 +94,7 @@ func (e *Engine) Provision(mac string, dnsOnly bool) (string, error) {
 		return "", fmt.Errorf("config not found for node %q", info.NodeKey)
 	}
 
-	newIP := fmt.Sprintf("%s.%d", nodeConf.Subnet, info.VMID-vmidBase)
+	newIP := fmt.Sprintf("%s.%d", nodeConf.Subnet, info.VMID-e.settings.VMIDBase)
 
 	octets := strings.Split(nodeConf.Subnet, ".")
 	if len(octets) < 3 {
@@ -99,14 +104,14 @@ func (e *Engine) Provision(mac string, dnsOnly bool) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("invalid subnet octet %q: %w", octets[2], err)
 	}
-	dnsmasqFile := fmt.Sprintf("/etc/dnsmasq.d/%sx%02d.conf", strings.ToLower(info.RealNode), subnetOctet)
+	dnsmasqFile := fmt.Sprintf("%s/%sx%02d.conf", e.settings.DnsmasqDir, strings.ToLower(info.RealNode), subnetOctet)
 
 	domain := fmt.Sprintf("%s.%s%s", strings.ToLower(info.Name), strings.ToLower(info.RealNode), e.Domain)
 	routeID := fmt.Sprintf("proxy-%d-%s", info.VMID, info.NodeKey)
 	tlsID := fmt.Sprintf("tls-%d-%s", info.VMID, info.NodeKey)
 
 	if info.IsCaddy {
-		if err := e.IMQ.AddHost(mac, newIP, info.Name, "/etc/dnsmasq.d/caddy.conf"); err != nil {
+		if err := e.IMQ.AddHost(mac, newIP, info.Name, e.settings.CaddyFile); err != nil {
 			return "", fmt.Errorf("add caddy host: %w", err)
 		}
 		e.reloadDnsmasq()
@@ -179,7 +184,7 @@ func (e *Engine) Deprovision(mac string) error {
 }
 
 // reloadDnsmasq перезагружает конфиг матери; ошибка логируется, но не валит
-// операцию (DNsmasq перечитает конфиг при следующем reload/рестарте).
+// операцию (dnsmasq перечитает конфиг при следующем reload/рестарте).
 func (e *Engine) reloadDnsmasq() {
 	if err := e.IMQ.Reload(); err != nil {
 		slog.Warn("dnsmasq reload failed", "err", err)
@@ -214,7 +219,8 @@ func (e *Engine) ReplayCaddy() (int, []string, error) {
 	}
 
 	// Один финальный /stop на каждую затронутую ноду — сброс cert cache.
-	time.Sleep(2 * time.Second)
+	// Сначала ждём выпуска сертификатов, потом перезапускаем.
+	time.Sleep(e.settings.CertSettle)
 	for node := range touchedNodes {
 		if err := e.Caddy.RestartCaddy(node); err != nil {
 			errs = append(errs, fmt.Sprintf("restart %s: %v", node, err))

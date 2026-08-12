@@ -27,6 +27,14 @@ import (
 	"time"
 )
 
+// ProxmoxSettings — конвенция тегов PVE и параметры клиента.
+type ProxmoxSettings struct {
+	PortPrefix  string        // префикс тега порта ("port-")
+	ProtoPrefix string        // префикс тега протокола ("proto-")
+	NamePrefix  string        // префикс тега имени ("name-")
+	Timeout     time.Duration // таймаут HTTP-клиента
+}
+
 // NodeConfig — конфиг одной ноды из config.json.
 type NodeConfig struct {
 	Subnet     string `json:"subnet"`
@@ -38,6 +46,7 @@ type NodeConfig struct {
 
 type PveClient struct {
 	Nodes  map[string]NodeConfig
+	tags   ProxmoxSettings
 	client *http.Client
 }
 
@@ -52,15 +61,19 @@ type ContainerInfo struct {
 	IsCaddy  bool
 }
 
-func NewPveClient(nodes map[string]NodeConfig) *PveClient {
+func NewPveClient(nodes map[string]NodeConfig, s ProxmoxSettings) *PveClient {
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	if s.Timeout == 0 {
+		s.Timeout = 10 * time.Second
+	}
 	cleanNodes := make(map[string]NodeConfig, len(nodes))
 	for k, v := range nodes {
 		cleanNodes[strings.ToLower(k)] = v
 	}
 	return &PveClient{
 		Nodes:  cleanNodes,
-		client: &http.Client{Transport: tr, Timeout: 10 * time.Second},
+		tags:   s,
+		client: &http.Client{Transport: tr, Timeout: s.Timeout},
 	}
 }
 
@@ -167,18 +180,18 @@ func (p *PveClient) scanType(nodeKey string, conf NodeConfig, vmType, targetMac 
 				for _, t := range strings.Fields(tags) {
 					t = strings.ToLower(strings.TrimSpace(t))
 					switch {
-					case strings.HasPrefix(t, "port-"):
-						info.Port = strings.TrimPrefix(t, "port-")
-					case strings.HasPrefix(t, "proto-"):
-						info.Protocol = strings.TrimPrefix(t, "proto-")
-					case strings.HasPrefix(t, "name-"):
-						info.Name = strings.TrimPrefix(t, "name-")
+					case strings.HasPrefix(t, p.tags.PortPrefix):
+						info.Port = strings.TrimPrefix(t, p.tags.PortPrefix)
+					case strings.HasPrefix(t, p.tags.ProtoPrefix):
+						info.Protocol = strings.TrimPrefix(t, p.tags.ProtoPrefix)
+					case strings.HasPrefix(t, p.tags.NamePrefix):
+						info.Name = strings.TrimPrefix(t, p.tags.NamePrefix)
 					}
 				}
 			}
 
 			if !info.IsCaddy && info.Port == "" {
-				return nil, fmt.Errorf("у контейнера %s нет тега port-XX", item.Name)
+				return nil, fmt.Errorf("у контейнера %s нет тега %sXX", item.Name, p.tags.PortPrefix)
 			}
 			return info, nil
 		}
