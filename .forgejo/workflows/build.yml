@@ -87,6 +87,7 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             bash tar \
+            nodejs \
             jq \
             gcc
 
