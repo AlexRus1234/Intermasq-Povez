@@ -29,10 +29,11 @@ import (
 
 // ProxmoxSettings — конвенция тегов PVE и параметры клиента.
 type ProxmoxSettings struct {
-	PortPrefix  string        // префикс тега порта ("port-")
-	ProtoPrefix string        // префикс тега протокола ("proto-")
-	NamePrefix  string        // префикс тега имени ("name-")
-	Timeout     time.Duration // таймаут HTTP-клиента
+	PortPrefix         string        // префикс тега порта ("port-")
+	ProtoPrefix        string        // префикс тега протокола ("proto-")
+	NamePrefix         string        // префикс тега имени ("name-")
+	InsecureSkipVerify bool          // пропускать проверку TLS (PVE обычно self-signed)
+	Timeout            time.Duration // таймаут HTTP-клиента
 }
 
 // NodeConfig — конфиг одной ноды из config.json.
@@ -62,7 +63,7 @@ type ContainerInfo struct {
 }
 
 func NewPveClient(nodes map[string]NodeConfig, s ProxmoxSettings) *PveClient {
-	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: s.InsecureSkipVerify}}
 	if s.Timeout == 0 {
 		s.Timeout = 10 * time.Second
 	}

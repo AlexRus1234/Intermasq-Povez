@@ -59,9 +59,10 @@ type Config struct {
 
 // CaddyConfig — параметры TLS/reverse-proxy в Caddy.
 type CaddyConfig struct {
-	ACMEURL string `json:"acme_url"` // Step-CA ACME directory URL
-	CARoots string `json:"ca_roots"` // путь к root CA PEM для Step-CA
-	Listen  string `json:"listen"`   // порт, который слушает Caddy (":443")
+	ACMEURL          string `json:"acme_url"`          // Step-CA ACME directory URL
+	CARoots          string `json:"ca_roots"`          // путь к root CA PEM для Step-CA
+	Listen           string `json:"listen"`            // порт, который слушает Caddy (":443")
+	UpstreamInsecure *bool  `json:"upstream_insecure"` // insecure_skip_verify для https upstream (default true)
 }
 
 // DnsmasqConfig — расположение конфигов dnsmasq, куда плагин пишет host-записи.
@@ -77,10 +78,11 @@ type HTTPConfig struct {
 
 // ProxmoxConfig — конвенция тегов PVE и формула IP-адресации.
 type ProxmoxConfig struct {
-	PortPrefix  string `json:"port_prefix"`
-	ProtoPrefix string `json:"proto_prefix"`
-	NamePrefix  string `json:"name_prefix"`
-	VMIDBase    int    `json:"vmid_base"` // базовый VMID для расчёта IP-суффикса
+	PortPrefix         string `json:"port_prefix"`
+	ProtoPrefix        string `json:"proto_prefix"`
+	NamePrefix         string `json:"name_prefix"`
+	VMIDBase           int    `json:"vmid_base"`            // базовый VMID для расчёта IP-суффикса
+	InsecureSkipVerify *bool  `json:"insecure_skip_verify"` // пропускать проверку TLS PVE (default true)
 }
 
 // PluginConfig — параметры запуска плагина.
@@ -153,15 +155,26 @@ func intermasqAPIKey(cfg *Config) string {
 	return cfg.IntermasqKey
 }
 
+// boolOr разрешает nullable bool из config: если p != nil — *p, иначе def.
+// Нужно чтобы отличить явно заданный false от "поле отсутствует" (default true
+// для insecure TLS во внутренней сети).
+func boolOr(def bool, p *bool) bool {
+	if p != nil {
+		return *p
+	}
+	return def
+}
+
 func buildClients(cfg *Config) (*core.PveClient, *core.IntermasqClient, *core.CaddyClient) {
 	timeout := time.Duration(cfg.HTTP.TimeoutSeconds) * time.Second
 	settle := time.Duration(cfg.Plugin.CertSettleSeconds) * time.Second
 
 	pve := core.NewPveClient(cfg.Nodes, core.ProxmoxSettings{
-		PortPrefix:  cfg.Proxmox.PortPrefix,
-		ProtoPrefix: cfg.Proxmox.ProtoPrefix,
-		NamePrefix:  cfg.Proxmox.NamePrefix,
-		Timeout:     timeout,
+		PortPrefix:         cfg.Proxmox.PortPrefix,
+		ProtoPrefix:        cfg.Proxmox.ProtoPrefix,
+		NamePrefix:         cfg.Proxmox.NamePrefix,
+		InsecureSkipVerify: boolOr(true, cfg.Proxmox.InsecureSkipVerify),
+		Timeout:            timeout,
 	})
 	imq := core.NewIntermasqClient(cfg.IntermasqURL, intermasqAPIKey(cfg), timeout)
 
@@ -170,11 +183,12 @@ func buildClients(cfg *Config) (*core.PveClient, *core.IntermasqClient, *core.Ca
 		caddyURLs[name] = data.CaddyURL
 	}
 	caddy := core.NewCaddyClient(caddyURLs, core.CaddySettings{
-		ACMEURL:        cfg.Caddy.ACMEURL,
-		CARoots:        cfg.Caddy.CARoots,
-		Listen:         cfg.Caddy.Listen,
-		Timeout:        timeout,
-		CertSettleTime: settle,
+		ACMEURL:          cfg.Caddy.ACMEURL,
+		CARoots:          cfg.Caddy.CARoots,
+		Listen:           cfg.Caddy.Listen,
+		UpstreamInsecure: boolOr(true, cfg.Caddy.UpstreamInsecure),
+		Timeout:          timeout,
+		CertSettleTime:   settle,
 	})
 	return pve, imq, caddy
 }

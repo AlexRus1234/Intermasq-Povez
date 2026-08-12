@@ -23,8 +23,9 @@ import (
 	"time"
 )
 
-func TestGenerateRouteJSON_HTTP(t *testing.T) {
-	r := GenerateRouteJSON("a.test", "10.0.0.1", "8080", "http", "proxy-1")
+func TestCaddyClient_GenerateRouteJSON_HTTP(t *testing.T) {
+	c := NewCaddyClient(nil, CaddySettings{UpstreamInsecure: true})
+	r := c.generateRouteJSON("a.test", "10.0.0.1", "8080", "http", "proxy-1")
 
 	if r["@id"] != "proxy-1" {
 		t.Errorf("@id = %v, want proxy-1", r["@id"])
@@ -55,8 +56,10 @@ func TestGenerateRouteJSON_HTTP(t *testing.T) {
 	}
 }
 
-func TestGenerateRouteJSON_HTTPSSetsInsecureTLS(t *testing.T) {
-	r := GenerateRouteJSON("a.test", "10.0.0.1", "8443", "https", "proxy-1")
+func TestCaddyClient_GenerateRouteJSON_HTTPSInsecureFromSettings(t *testing.T) {
+	// UpstreamInsecure=true → tls.insecure_skip_verify=true
+	c := NewCaddyClient(nil, CaddySettings{UpstreamInsecure: true})
+	r := c.generateRouteJSON("a.test", "10.0.0.1", "8443", "https", "proxy-1")
 	handle := r["handle"].([]interface{})[0].(map[string]interface{})
 	tr := handle["transport"].(map[string]interface{})
 	tls, ok := tr["tls"].(map[string]interface{})
@@ -65,6 +68,16 @@ func TestGenerateRouteJSON_HTTPSSetsInsecureTLS(t *testing.T) {
 	}
 	if tls["insecure_skip_verify"] != true {
 		t.Errorf("insecure_skip_verify = %v, want true", tls["insecure_skip_verify"])
+	}
+
+	// UpstreamInsecure=false → tls.insecure_skip_verify=false (config-driven)
+	c2 := NewCaddyClient(nil, CaddySettings{UpstreamInsecure: false})
+	r2 := c2.generateRouteJSON("a.test", "10.0.0.1", "8443", "https", "proxy-1")
+	handle2 := r2["handle"].([]interface{})[0].(map[string]interface{})
+	tr2 := handle2["transport"].(map[string]interface{})
+	tls2 := tr2["tls"].(map[string]interface{})
+	if tls2["insecure_skip_verify"] != false {
+		t.Errorf("insecure_skip_verify = %v, want false (from settings)", tls2["insecure_skip_verify"])
 	}
 }
 

@@ -29,11 +29,12 @@ import (
 
 // CaddySettings — параметры Caddy-клиента (ACME, CA, порт, таймауты).
 type CaddySettings struct {
-	ACMEURL        string        // Step-CA ACME directory URL
-	CARoots        string        // путь к root CA PEM
-	Listen         string        // порт Caddy (":443")
-	Timeout        time.Duration // таймаут HTTP-клиента
-	CertSettleTime time.Duration // пауза перед /stop (выпуск cert)
+	ACMEURL          string        // Step-CA ACME directory URL
+	CARoots          string        // путь к root CA PEM
+	Listen           string        // порт Caddy (":443")
+	UpstreamInsecure bool          // insecure_skip_verify для https upstream
+	Timeout          time.Duration // таймаут HTTP-клиента
+	CertSettleTime   time.Duration // пауза перед /stop (выпуск cert)
 }
 
 type CaddyClient struct {
@@ -84,11 +85,14 @@ func (c *CaddyClient) doJSON(method, url string, body interface{}) (*http.Respon
 	return c.client.Do(req)
 }
 
-func GenerateRouteJSON(domain, targetIP, targetPort, protocol, routeID string) map[string]interface{} {
+// generateRouteJSON строит конфиг reverse_proxy-маршрута. Для https upstream
+// добавляет transport.tls.insecure_skip_verify из настроек клиента (внутренние
+// сервисы обычно с self-signed сертификатом).
+func (c *CaddyClient) generateRouteJSON(domain, targetIP, targetPort, protocol, routeID string) map[string]interface{} {
 	upstream := map[string]interface{}{"dial": fmt.Sprintf("%s:%s", targetIP, targetPort)}
 	transport := map[string]interface{}{"protocol": "http"}
 	if protocol == "https" {
-		transport["tls"] = map[string]interface{}{"insecure_skip_verify": true}
+		transport["tls"] = map[string]interface{}{"insecure_skip_verify": c.settings.UpstreamInsecure}
 	}
 	handler := map[string]interface{}{
 		"handler":   "reverse_proxy",
@@ -255,7 +259,7 @@ func (c *CaddyClient) installRouteAndCert(nodeName, domain, targetIP, targetPort
 		return fmt.Errorf("automate cert: %w", err)
 	}
 
-	routeConfig := GenerateRouteJSON(domain, targetIP, targetPort, protocol, routeID)
+	routeConfig := c.generateRouteJSON(domain, targetIP, targetPort, protocol, routeID)
 	initRoute := func() error { return c.initSrv0(baseURL, routeConfig) }
 	if err := c.upsertByID(baseURL, routeID, "/config/apps/http/servers/srv0/routes", routeConfig, initRoute); err != nil {
 		return fmt.Errorf("route: %w", err)

@@ -16,7 +16,8 @@
     "caddy": {
         "acme_url": "https://172.20.0.1:9000/acme/acme/directory",
         "ca_roots": "/etc/caddy/root_ca.crt",
-        "listen": ":443"
+        "listen": ":443",
+        "upstream_insecure": true
     },
     "dnsmasq": {
         "conf_dir": "/etc/dnsmasq.d",
@@ -29,7 +30,8 @@
         "port_prefix": "port-",
         "proto_prefix": "proto-",
         "name_prefix": "name-",
-        "vmid_base": 98
+        "vmid_base": 98,
+        "insecure_skip_verify": true
     },
     "plugin": {
         "tcp_debug_port": ":5000",
