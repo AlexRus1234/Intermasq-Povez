@@ -3,7 +3,7 @@ yadr-prov
 yadr-prov-linux
 povez
 povez-linux
-*.exe
+*.exe 
 
 # Runtime config with secrets — never commit. Copy config.example.json
 # to config.json and fill in real credentials locally.
