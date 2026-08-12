@@ -18,6 +18,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -55,6 +56,21 @@ func allowMethod(w http.ResponseWriter, r *http.Request, methods ...string) bool
 	return false
 }
 
+// statusForError отображает типизированную ошибку engine в HTTP-статус.
+// Незнакомые ошибки → 500.
+func statusForError(err error) int {
+	switch {
+	case errors.Is(err, core.ErrContainerNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, core.ErrContainerRunning):
+		return http.StatusConflict
+	case errors.Is(err, core.ErrInvalidIP):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
 type provisionRequest struct {
 	MAC     string `json:"mac"`
 	DnsOnly bool   `json:"dnsOnly"`
@@ -85,9 +101,13 @@ func (s *ApiServer) HandleProvision(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
+	if req.MAC == "" {
+		jsonError(w, http.StatusBadRequest, "MAC address is required")
+		return
+	}
 	resultMsg, err := s.Engine.Provision(req.MAC, req.DnsOnly)
 	if err != nil {
-		jsonError(w, http.StatusInternalServerError, err.Error())
+		jsonError(w, statusForError(err), err.Error())
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]string{"message": resultMsg})
@@ -109,7 +129,7 @@ func (s *ApiServer) HandleDeprovision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Engine.Deprovision(req.MAC); err != nil {
-		jsonError(w, http.StatusInternalServerError, err.Error())
+		jsonError(w, statusForError(err), err.Error())
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]string{"message": "Успешно удалено из Dnsmasq и Caddy"})

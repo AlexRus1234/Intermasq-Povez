@@ -105,20 +105,23 @@ func (p *PveClient) FindByMAC(mac string) (*ContainerInfo, error) {
 	slog.Info("proxmox search by mac", "mac", mac)
 
 	for nodeKey, conf := range p.Nodes {
-		if info, err := p.scanType(nodeKey, conf, "lxc", mac); err == nil {
-			return info, nil
-		}
-		if info, err := p.scanType(nodeKey, conf, "qemu", mac); err == nil {
+		// scanNode делает один запрос /cluster/resources на ноду и сам перебирает
+		// lxc и qemu в нужном порядке. Ошибка одной ноды не валит весь поиск —
+		// она логируется внутри scanNode, после чего переходим к следующей ноде.
+		if info, err := p.scanNode(nodeKey, conf, mac); err == nil {
 			return info, nil
 		}
 	}
 	return nil, fmt.Errorf("MAC %s не найден нигде", mac)
 }
 
-func (p *PveClient) scanType(nodeKey string, conf NodeConfig, vmType, targetMac string) (*ContainerInfo, error) {
+// scanNode делает один запрос /cluster/resources для ноды и ищет MAC сначала
+// среди LXC, потом среди QEMU — тот же приоритет, что был при раздельных вызовах.
+func (p *PveClient) scanNode(nodeKey string, conf NodeConfig, targetMac string) (*ContainerInfo, error) {
 	// /cluster/resources — самый надёжный способ узнать VMID и реальное имя ноды.
 	resBody, err := p.request(conf, "GET", "/cluster/resources")
 	if err != nil {
+		slog.Warn("cluster/resources fetch failed", "node", nodeKey, "err", err)
 		return nil, err
 	}
 
@@ -132,72 +135,86 @@ func (p *PveClient) scanType(nodeKey string, conf NodeConfig, vmType, targetMac 
 		}
 	}
 	if err := json.Unmarshal(resBody, &clusterRes); err != nil {
+		slog.Warn("parse cluster resources failed", "node", nodeKey, "err", err)
 		return nil, fmt.Errorf("parse cluster resources: %w", err)
 	}
 
-	for _, item := range clusterRes.Data {
-		if item.Type != vmType {
-			continue
-		}
-		vmid := int(item.VMID)
-
-		// item.Node — реальное имя ноды, иначе API вернёт 596/500.
-		confBody, err := p.request(conf, "GET", fmt.Sprintf("/nodes/%s/%s/%d/config", item.Node, vmType, vmid))
-		if err != nil {
-			continue
-		}
-
-		var vmConf struct {
-			Data map[string]interface{} `json:"data"`
-		}
-		if err := json.Unmarshal(confBody, &vmConf); err != nil {
-			slog.Warn("parse vm config failed", "vmid", vmid, "node", item.Node, "err", err)
-			continue
-		}
-
-		// Ищем MAC в net*-интерфейсах.
-		found := false
-		for k, v := range vmConf.Data {
-			if strings.HasPrefix(k, "net") && strings.Contains(strings.ToLower(fmt.Sprint(v)), targetMac) {
-				found = true
-				break
+	// Порядок lxc → qemu детерминирует выбор при прочих равных.
+	for _, vmType := range []string{"lxc", "qemu"} {
+		for _, item := range clusterRes.Data {
+			if item.Type != vmType {
+				continue
 			}
-		}
-
-		if found {
-			slog.Info("proxmox container found", "name", item.Name, "vmid", vmid, "node", item.Node, "key", nodeKey)
-			info := &ContainerInfo{
-				NodeKey:  nodeKey,
-				RealNode: item.Node,
-				VMID:     vmid,
-				Name:     item.Name,
-				Status:   item.Status,
-				Protocol: "http",
-				IsCaddy:  strings.Contains(strings.ToLower(item.Name), "caddy"),
+			info, err := p.matchGuest(nodeKey, conf, item.Node, vmType, int(item.VMID), item.Name, item.Status, targetMac)
+			if err == nil {
+				return info, nil
 			}
-			if tags, ok := vmConf.Data["tags"].(string); ok {
-				tags = strings.ReplaceAll(tags, ",", " ")
-				tags = strings.ReplaceAll(tags, ";", " ")
-				for _, t := range strings.Fields(tags) {
-					t = strings.ToLower(strings.TrimSpace(t))
-					switch {
-					case strings.HasPrefix(t, p.tags.PortPrefix):
-						info.Port = strings.TrimPrefix(t, p.tags.PortPrefix)
-					case strings.HasPrefix(t, p.tags.ProtoPrefix):
-						info.Protocol = strings.TrimPrefix(t, p.tags.ProtoPrefix)
-					case strings.HasPrefix(t, p.tags.NamePrefix):
-						info.Name = strings.TrimPrefix(t, p.tags.NamePrefix)
-					}
-				}
-			}
-
-			if !info.IsCaddy && info.Port == "" {
-				return nil, fmt.Errorf("у контейнера %s нет тега %sXX", item.Name, p.tags.PortPrefix)
-			}
-			return info, nil
 		}
 	}
 	return nil, fmt.Errorf("not found")
+}
+
+// matchGuest тащит config конкретного гостя, проверяет MAC и собирает ContainerInfo.
+// Любая ошибка (сеть, 5xx, отсутствие тега порта) возвращается наверх — scanNode
+// при этом просто перейдёт к следующему гостю.
+func (p *PveClient) matchGuest(nodeKey string, conf NodeConfig, realNode, vmType string, vmid int, name, status, targetMac string) (*ContainerInfo, error) {
+	// realNode — реальное имя ноды, иначе API вернёт 596/500.
+	confBody, err := p.request(conf, "GET", fmt.Sprintf("/nodes/%s/%s/%d/config", realNode, vmType, vmid))
+	if err != nil {
+		slog.Warn("vm config fetch failed", "vmid", vmid, "node", realNode, "err", err)
+		return nil, err
+	}
+
+	var vmConf struct {
+		Data map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(confBody, &vmConf); err != nil {
+		slog.Warn("parse vm config failed", "vmid", vmid, "node", realNode, "err", err)
+		return nil, err
+	}
+
+	// Ищем MAC в net*-интерфейсах.
+	found := false
+	for k, v := range vmConf.Data {
+		if strings.HasPrefix(k, "net") && strings.Contains(strings.ToLower(fmt.Sprint(v)), targetMac) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("not found")
+	}
+
+	slog.Info("proxmox container found", "name", name, "vmid", vmid, "node", realNode, "key", nodeKey)
+	info := &ContainerInfo{
+		NodeKey:  nodeKey,
+		RealNode: realNode,
+		VMID:     vmid,
+		Name:     name,
+		Status:   status,
+		Protocol: "http",
+		IsCaddy:  strings.Contains(strings.ToLower(name), "caddy"),
+	}
+	if tags, ok := vmConf.Data["tags"].(string); ok {
+		tags = strings.ReplaceAll(tags, ",", " ")
+		tags = strings.ReplaceAll(tags, ";", " ")
+		for _, t := range strings.Fields(tags) {
+			t = strings.ToLower(strings.TrimSpace(t))
+			switch {
+			case strings.HasPrefix(t, p.tags.PortPrefix):
+				info.Port = strings.TrimPrefix(t, p.tags.PortPrefix)
+			case strings.HasPrefix(t, p.tags.ProtoPrefix):
+				info.Protocol = strings.TrimPrefix(t, p.tags.ProtoPrefix)
+			case strings.HasPrefix(t, p.tags.NamePrefix):
+				info.Name = strings.TrimPrefix(t, p.tags.NamePrefix)
+			}
+		}
+	}
+
+	if !info.IsCaddy && info.Port == "" {
+		return nil, fmt.Errorf("у контейнера %s нет тега %sXX", name, p.tags.PortPrefix)
+	}
+	return info, nil
 }
 
 // GetStatus возвращает текущий статус (running/stopped/...) контейнера/ВМ.

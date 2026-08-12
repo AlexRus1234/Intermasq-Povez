@@ -17,6 +17,8 @@
 package core
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -108,5 +110,84 @@ func TestEngine_GetPendingDevices_HostsError(t *testing.T) {
 
 	if _, err := e.GetPendingDevices(); err == nil {
 		t.Errorf("expected error when /hosts returns 500, got nil")
+	}
+}
+
+func TestMakeIDs(t *testing.T) {
+	info := &ContainerInfo{VMID: 150, NodeKey: "yadr01"}
+	routeID, tlsID := makeIDs(info)
+	if routeID != "proxy-150-yadr01" {
+		t.Errorf("routeID = %q, want proxy-150-yadr01", routeID)
+	}
+	if tlsID != "tls-150-yadr01" {
+		t.Errorf("tlsID = %q, want tls-150-yadr01", tlsID)
+	}
+}
+
+// TestEngine_Provision_IPValidation проверяет расчёт последнего октета IP
+// через computeIP (используется Provision). Октет = VMID - VMIDBase и обязан
+// лежать в [0,255], иначе ErrInvalidIP.
+func TestEngine_Provision_IPValidation(t *testing.T) {
+	e := &Engine{settings: EngineSettings{VMIDBase: 100}}
+	nodeConf := NodeConfig{Subnet: "172.20.5"}
+
+	tests := []struct {
+		name    string
+		vmid    int
+		wantIP  string
+		wantErr error
+	}{
+		{"valid low", 100, "172.20.5.0", nil},
+		{"valid mid", 150, "172.20.5.50", nil},
+		{"valid high", 355, "172.20.5.255", nil},
+		{"overflow", 500, "", ErrInvalidIP}, // 400 > 255
+		{"negative", 50, "", ErrInvalidIP},  // -50 < 0
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &ContainerInfo{VMID: tc.vmid}
+			ip, err := e.computeIP(info, nodeConf)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Errorf("computeIP err = %v, want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if ip != tc.wantIP {
+				t.Errorf("computeIP = %q, want %q", ip, tc.wantIP)
+			}
+		})
+	}
+}
+
+// mockPveRunning эмулирует PVE: контейнер найден по MAC, но status=running.
+// Депровиж должен вернуть ErrContainerRunning, не доходя до Caddy/IMQ.
+func mockPveRunning(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/cluster/resources":
+			fmt.Fprint(w, `{"data":[{"node":"YADR01","type":"lxc","vmid":100,"name":"web01","status":"running"}]}`)
+		case r.URL.Path == "/nodes/YADR01/lxc/100/config":
+			fmt.Fprint(w, `{"data":{"net0":"virtio=AA:BB:CC:DD:EE:01","tags":"port-8080"}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestEngine_Deprovision_ContainerRunning(t *testing.T) {
+	srv := mockPveRunning(t)
+	pve := NewPveClient(map[string]NodeConfig{"yadr01": {PveURL: srv.URL}}, defaultProxmoxSettings())
+	e := &Engine{PVE: pve}
+
+	err := e.Deprovision("aa:bb:cc:dd:ee:01")
+	if !errors.Is(err, ErrContainerRunning) {
+		t.Errorf("expected ErrContainerRunning, got %v", err)
 	}
 }

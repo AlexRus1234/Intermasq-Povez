@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -143,5 +144,77 @@ func TestPveClient_NewPveClient_NormalizesKeys(t *testing.T) {
 	}
 	if _, ok := p.Nodes["YADR01"]; ok {
 		t.Errorf("original-case key still present after normalise")
+	}
+}
+
+// TestPveClient_FindByMAC_FetchesClusterResourcesOncePerNode проверяет, что
+// /cluster/resources запрашивается ровно один раз на ноду, даже если гости
+// разбросаны по lxc и qemu. До рефакторинга каждый scanType делал свой запрос,
+// что для N нод давало 2N одинаковых тяжёлых ответов.
+func TestPveClient_FindByMAC_FetchesClusterResourcesOncePerNode(t *testing.T) {
+	var clusterCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cluster/resources":
+			clusterCalls.Add(1)
+			fmt.Fprint(w, `{"data":[
+				{"node":"YADR01","type":"lxc","vmid":100,"name":"web01","status":"running"},
+				{"node":"YADR01","type":"qemu","vmid":200,"name":"vm01","status":"running"}
+			]}`)
+		case "/nodes/YADR01/lxc/100/config":
+			// LXC без совпадения по MAC.
+			fmt.Fprint(w, `{"data":{"net0":"virtio=11:22:33:44:55:66"}}`)
+		case "/nodes/YADR01/qemu/200/config":
+			// QEMU с нужным MAC.
+			fmt.Fprint(w, `{"data":{"net0":"virtio=AA:BB:CC:DD:EE:01","tags":"port-8080"}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	p := NewPveClient(map[string]NodeConfig{"yadr01": {PveURL: srv.URL}}, defaultProxmoxSettings())
+	info, err := p.FindByMAC("aa:bb:cc:dd:ee:01")
+	if err != nil {
+		t.Fatalf("FindByMAC: %v", err)
+	}
+	if info.VMID != 200 {
+		t.Errorf("VMID = %d, want 200 (qemu match after lxc miss)", info.VMID)
+	}
+	if got := clusterCalls.Load(); got != 1 {
+		t.Errorf("/cluster/resources called %d times, want 1 (one fetch per node)", got)
+	}
+}
+
+// TestPveClient_FindByMAC_LogsConfigError проверяет, что 5xx на config одного
+// гостя не роняет весь поиск: больной гость пропускается, а следующий с тем же
+// MAC успешно находится.
+func TestPveClient_FindByMAC_LogsConfigError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cluster/resources":
+			fmt.Fprint(w, `{"data":[
+				{"node":"YADR01","type":"lxc","vmid":100,"name":"broken01","status":"running"},
+				{"node":"YADR01","type":"lxc","vmid":101,"name":"web01","status":"running"}
+			]}`)
+		case "/nodes/YADR01/lxc/100/config":
+			// Транзитный 5xx — гость должен быть пропущен, а не молча приравнен
+			// к "MAC не найден нигде".
+			w.WriteHeader(http.StatusInternalServerError)
+		case "/nodes/YADR01/lxc/101/config":
+			fmt.Fprint(w, `{"data":{"net0":"virtio=AA:BB:CC:DD:EE:01","tags":"port-8080"}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	p := NewPveClient(map[string]NodeConfig{"yadr01": {PveURL: srv.URL}}, defaultProxmoxSettings())
+	info, err := p.FindByMAC("aa:bb:cc:dd:ee:01")
+	if err != nil {
+		t.Fatalf("FindByMAC: %v", err)
+	}
+	if info.VMID != 101 {
+		t.Errorf("VMID = %d, want 101 (skipping 500 on vmid 100)", info.VMID)
 	}
 }

@@ -142,7 +142,7 @@ func TestCaddyClient_UpsertByID_CreatesViaPOST(t *testing.T) {
 	c := NewCaddyClient(map[string]string{"node": srv.URL}, CaddySettings{Timeout: 5 * time.Second})
 
 	if err := c.upsertByID(srv.URL, "proxy-1", "/config/apps/http/servers/srv0/routes",
-		map[string]interface{}{"@id": "proxy-1"}, nil); err != nil {
+		map[string]interface{}{"@id": "proxy-1"}, nil, nil); err != nil {
 		t.Fatalf("upsertByID: %v", err)
 	}
 	if lastMethod != http.MethodPost {
@@ -168,11 +168,54 @@ func TestCaddyClient_UpsertByID_UpdatesViaPUT(t *testing.T) {
 	c := NewCaddyClient(map[string]string{"node": srv.URL}, CaddySettings{Timeout: 5 * time.Second})
 
 	if err := c.upsertByID(srv.URL, "proxy-1", "/config/apps/http/servers/srv0/routes",
-		map[string]interface{}{"@id": "proxy-1"}, nil); err != nil {
+		map[string]interface{}{"@id": "proxy-1"}, nil, nil); err != nil {
 		t.Fatalf("upsertByID: %v", err)
 	}
 	if lastMethod != http.MethodPut {
 		t.Errorf("expected PUT for existing id, got %s", lastMethod)
+	}
+}
+
+// TestCaddyClient_UpsertByID_GETNon404Propagates: GET /id/X → 500 не должен
+// проваливаться в POST (иначе создаст дубликат). Ожидаем ошибку и ноль POST.
+func TestCaddyClient_UpsertByID_GETNon404Propagates(t *testing.T) {
+	var postCount int
+	srv := mockCaddy(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/id/proxy-1":
+			w.WriteHeader(http.StatusInternalServerError)
+		case r.Method == http.MethodPost && r.URL.Path == "/config/apps/http/servers/srv0/routes":
+			postCount++
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected call: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+	c := NewCaddyClient(map[string]string{"node": srv.URL}, CaddySettings{Timeout: 5 * time.Second})
+
+	err := c.upsertByID(srv.URL, "proxy-1", "/config/apps/http/servers/srv0/routes",
+		map[string]interface{}{"@id": "proxy-1"}, nil, nil)
+	if err == nil {
+		t.Fatalf("expected error when GET returns 500, got nil")
+	}
+	if postCount != 0 {
+		t.Errorf("POST must not be attempted when GET returns non-404, got %d POST calls", postCount)
+	}
+}
+
+// TestCaddyClient_UpsertByID_GETNetworkErrorPropagates: сетевая ошибка на GET
+// (закрытый слушатель) не должна проваливаться в POST.
+func TestCaddyClient_UpsertByID_GETNetworkErrorPropagates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	addr := srv.URL
+	srv.Close() // порт больше не слушается → connection refused
+
+	c := NewCaddyClient(nil, CaddySettings{Timeout: 2 * time.Second})
+	err := c.upsertByID(addr, "proxy-1", "/config/apps/http/servers/srv0/routes",
+		map[string]interface{}{"@id": "proxy-1"}, nil, nil)
+	if err == nil {
+		t.Fatalf("expected network error from unreachable server, got nil")
 	}
 }
 
@@ -228,5 +271,76 @@ func TestCaddyClient_NewCaddyClient_NormalizesKeys(t *testing.T) {
 	u, _ := c2.baseURL("n")
 	if u != "http://c:2019" {
 		t.Errorf("trailing slash not trimmed: %q", u)
+	}
+}
+
+func TestCaddyClient_DisableLocalCerts_ReturnsErrorOn500(t *testing.T) {
+	srv := mockCaddy(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	c := NewCaddyClient(map[string]string{"node": srv.URL}, CaddySettings{Timeout: 5 * time.Second})
+	if err := c.disableLocalCerts(srv.URL); err == nil {
+		t.Fatalf("expected error on 500, got nil")
+	}
+}
+
+func TestCaddyClient_InitTLSParent_ReturnsErrorOn500(t *testing.T) {
+	srv := mockCaddy(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	c := NewCaddyClient(map[string]string{"node": srv.URL}, CaddySettings{Timeout: 5 * time.Second})
+	if err := c.initTLSParent(srv.URL, map[string]interface{}{"@id": "tls-1"}); err == nil {
+		t.Fatalf("expected error on 500, got nil")
+	}
+}
+
+func TestCaddyClient_InitSrv0_ReturnsErrorOn500(t *testing.T) {
+	srv := mockCaddy(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	c := NewCaddyClient(map[string]string{"node": srv.URL}, CaddySettings{Timeout: 5 * time.Second})
+	if err := c.initSrv0(srv.URL, map[string]interface{}{"@id": "proxy-1"}); err == nil {
+		t.Fatalf("expected error on 500, got nil")
+	}
+}
+
+// TestCaddyClient_InitSrv0_DoesNotClobberExisting: POST route вернул 500, но
+// родитель srv0 уже существует (GET /config/apps/http/servers/srv0 → 200).
+// initIfMissing не должен вызываться — иначе PUT затрёт существующие routes.
+func TestCaddyClient_InitSrv0_DoesNotClobberExisting(t *testing.T) {
+	var initCalled bool
+	var postCount int
+	srv := mockCaddy(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/id/proxy-1":
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == "/config/apps/http/servers/srv0/routes":
+			postCount++
+			w.WriteHeader(http.StatusInternalServerError)
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/http/servers/srv0":
+			// родитель уже существует с маршрутами
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected call: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+	c := NewCaddyClient(map[string]string{"node": srv.URL}, CaddySettings{Timeout: 5 * time.Second})
+
+	parentExists := func() (bool, error) {
+		return c.pathExists(srv.URL, "/config/apps/http/servers/srv0")
+	}
+	initIfMissing := func() error { initCalled = true; return nil }
+
+	err := c.upsertByID(srv.URL, "proxy-1", "/config/apps/http/servers/srv0/routes",
+		map[string]interface{}{"@id": "proxy-1"}, parentExists, initIfMissing)
+	if err == nil {
+		t.Fatalf("expected error when parent exists and POST returns 500, got nil")
+	}
+	if initCalled {
+		t.Errorf("initIfMissing must NOT be called when parent already exists")
+	}
+	if postCount != 1 {
+		t.Errorf("expected exactly one POST (no init retry), got %d", postCount)
 	}
 }

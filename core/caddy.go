@@ -19,11 +19,13 @@ package core
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -130,31 +132,55 @@ func (c *CaddyClient) generateTLSPolicy(domain, tlsID string) map[string]interfa
 // createPath и initIfMissing нужны потому, что POST route/tls может вернуть
 // 500 при отсутствии родительского контейнера (srv0 / automation.policies),
 // тогда надо его инициализировать и повторить попытку.
-func (c *CaddyClient) upsertByID(baseURL, id, createPath string, payload map[string]interface{}, initIfMissing func() error) error {
+//
+// parentExists защищает от перетирания данных: POST может вернуть 500 не
+// только из-за отсутствия родителя (бывает конфликт @id, ошибки валидации и
+// т.п.). Если в этом случае безусловно вызвать initIfMissing, то PUT
+// /config/apps/http/servers/srv0 с единичным маршрутом затрёт уже
+// существующие routes. Поэтому перед initIfMissing вызывается parentExists —
+// если родитель уже есть, init пропускается и возвращается исходная ошибка.
+func (c *CaddyClient) upsertByID(
+	baseURL, id, createPath string,
+	payload map[string]interface{},
+	parentExists func() (bool, error),
+	initIfMissing func() error,
+) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
 	getResp, err := c.client.Get(fmt.Sprintf("%s/id/%s", baseURL, id))
-	if err == nil {
-		getResp.Body.Close()
-		if getResp.StatusCode == 200 {
-			req, _ := http.NewRequest("PUT", fmt.Sprintf("%s/id/%s", baseURL, id), bytes.NewBuffer(data))
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := c.client.Do(req)
-			if err != nil {
-				return err
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode >= 400 {
-				body, _ := io.ReadAll(resp.Body)
-				return fmt.Errorf("PUT %s (%d): %s", id, resp.StatusCode, string(body))
-			}
-			return nil
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", id, err)
+	}
+	defer getResp.Body.Close()
+
+	// Существующий @id → обновляем через PUT.
+	if getResp.StatusCode == http.StatusOK {
+		req, _ := http.NewRequest("PUT", fmt.Sprintf("%s/id/%s", baseURL, id), bytes.NewBuffer(data))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := c.client.Do(req)
+		if err != nil {
+			return err
 		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("PUT %s (%d): %s", id, resp.StatusCode, string(body))
+		}
+		return nil
 	}
 
+	// Любой статус, кроме 404, на GET — это ошибка (5xx на стороне Caddy,
+	// конфликт и т.п.), а не "отсутствует". НЕ проваливаемся в POST, иначе
+	// есть риск создать дубликат по @id.
+	if getResp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(getResp.Body)
+		return fmt.Errorf("GET %s (%d): %s", id, getResp.StatusCode, string(body))
+	}
+
+	// 404 — запись действительно отсутствует, создаём через POST.
 	req, _ := http.NewRequest("POST", baseURL+createPath, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.client.Do(req)
@@ -163,7 +189,20 @@ func (c *CaddyClient) upsertByID(baseURL, id, createPath string, payload map[str
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 500 && initIfMissing != nil {
+	if resp.StatusCode == http.StatusInternalServerError && initIfMissing != nil {
+		// Прежде чем пересоздавать родителя, убедимся что его действительно
+		// нет — иначе затрём уже существующие routes/policies одним routes.
+		if parentExists != nil {
+			exists, perr := parentExists()
+			if perr != nil {
+				return fmt.Errorf("parent check before init: %w", perr)
+			}
+			if exists {
+				body, _ := io.ReadAll(resp.Body)
+				return fmt.Errorf("POST %s (%d): parent already exists, init skipped to avoid clobber: %s",
+					createPath, resp.StatusCode, string(body))
+			}
+		}
 		if err := initIfMissing(); err != nil {
 			return err
 		}
@@ -185,6 +224,26 @@ func (c *CaddyClient) upsertByID(baseURL, id, createPath string, payload map[str
 		return fmt.Errorf("POST %s (%d): %s", createPath, resp.StatusCode, string(body))
 	}
 	return nil
+}
+
+// pathExists проверяет наличие узла конфигурации по пути (не по @id). true =
+// узел есть (200), false = 404 (узла нет), ошибка — любой другой статус или
+// сетевая проблема. Используется upsertByID как parentExists перед init.
+func (c *CaddyClient) pathExists(baseURL, cfgPath string) (bool, error) {
+	resp, err := c.client.Get(baseURL + cfgPath)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		body, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("GET %s (%d): %s", cfgPath, resp.StatusCode, string(body))
+	}
 }
 
 // automateCert заставляет Caddy немедленно выпустить сертификат для домена.
@@ -209,6 +268,10 @@ func (c *CaddyClient) disableLocalCerts(baseURL string) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("disable local_certs (%d): %s", resp.StatusCode, string(body))
+	}
 	return nil
 }
 
@@ -223,6 +286,10 @@ func (c *CaddyClient) initTLSParent(baseURL string, tlsPolicy map[string]interfa
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("init tls parent (%d): %s", resp.StatusCode, string(body))
+	}
 	return nil
 }
 
@@ -236,6 +303,10 @@ func (c *CaddyClient) initSrv0(baseURL string, routeConfig map[string]interface{
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("init srv0 (%d): %s", resp.StatusCode, string(body))
+	}
 	return nil
 }
 
@@ -251,7 +322,8 @@ func (c *CaddyClient) installRouteAndCert(nodeName, domain, targetIP, targetPort
 
 	tlsPolicy := c.generateTLSPolicy(domain, tlsID)
 	initTLS := func() error { return c.initTLSParent(baseURL, tlsPolicy) }
-	if err := c.upsertByID(baseURL, tlsID, "/config/apps/tls/automation/policies", tlsPolicy, initTLS); err != nil {
+	tlsParentExists := func() (bool, error) { return c.pathExists(baseURL, "/config/apps/tls") }
+	if err := c.upsertByID(baseURL, tlsID, "/config/apps/tls/automation/policies", tlsPolicy, tlsParentExists, initTLS); err != nil {
 		return fmt.Errorf("tls policy: %w", err)
 	}
 
@@ -261,7 +333,8 @@ func (c *CaddyClient) installRouteAndCert(nodeName, domain, targetIP, targetPort
 
 	routeConfig := c.generateRouteJSON(domain, targetIP, targetPort, protocol, routeID)
 	initRoute := func() error { return c.initSrv0(baseURL, routeConfig) }
-	if err := c.upsertByID(baseURL, routeID, "/config/apps/http/servers/srv0/routes", routeConfig, initRoute); err != nil {
+	srv0Exists := func() (bool, error) { return c.pathExists(baseURL, "/config/apps/http/servers/srv0") }
+	if err := c.upsertByID(baseURL, routeID, "/config/apps/http/servers/srv0/routes", routeConfig, srv0Exists, initRoute); err != nil {
 		return fmt.Errorf("route: %w", err)
 	}
 	return nil
@@ -336,6 +409,10 @@ func (c *CaddyClient) DeleteRouteAndTLS(nodeName, routeID, tlsID string) error {
 }
 
 // RestartCaddy шлёт POST /stop. Systemd (Restart=always) поднимет Caddy обратно.
+// POST /stop убивает процесс Caddy, поэтому HTTP-ответ может оборваться
+// посередине (connection closed / reset) — это ожидаемое поведение, а не
+// ошибка. Такие ошибки чтения мы игнорируем; всё остальное (включая реально
+// пришедший не-2xx статус) трактуем как ошибку.
 func (c *CaddyClient) RestartCaddy(nodeName string) error {
 	baseURL, err := c.baseURL(nodeName)
 	if err != nil {
@@ -344,8 +421,26 @@ func (c *CaddyClient) RestartCaddy(nodeName string) error {
 	slog.Info("caddy restart (POST /stop)", "node", nodeName)
 	resp, err := c.doJSON("POST", baseURL+"/stop", nil)
 	if err != nil {
+		if isConnClosedErr(err) {
+			return nil
+		}
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("restart /stop (%d): %s", resp.StatusCode, string(body))
+	}
+	if _, rerr := io.ReadAll(resp.Body); rerr != nil && !isConnClosedErr(rerr) {
+		return rerr
+	}
 	return nil
+}
+
+// isConnClosedErr сообщает, можно ли списать ошибку на обрыв соединения при
+// остановке Caddy: EOF, UnexpectedEOF или connection reset.
+func isConnClosedErr(err error) bool {
+	return errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, syscall.ECONNRESET)
 }

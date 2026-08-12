@@ -123,8 +123,8 @@ func (c *IntermasqClient) Reload() error {
 	return err
 }
 
-// FindFileByMAC ищет dnsmasq-файл, в котором зарегистрирован MAC, перебирая
-// текущий список хостов матери.
+// FindFileByMAC находит dnsmasq-файл хоста по MAC. У матери нет серверного
+// фильтра по MAC, поэтому делаем GET /hosts и сканируем список на клиенте.
 func (c *IntermasqClient) FindFileByMAC(mac string) (string, error) {
 	hosts, err := c.GetHosts()
 	if err != nil {
@@ -133,9 +133,16 @@ func (c *IntermasqClient) FindFileByMAC(mac string) (string, error) {
 
 	mac = strings.ToLower(mac)
 	for _, h := range hosts {
-		if strings.ToLower(h.Mac) == mac {
-			return strings.Split(h.File, "|")[0], nil
+		if strings.ToLower(h.Mac) != mac {
+			continue
 		}
+		// Пустой file пропускаем — иначе DeleteHost(mac, "") сделал бы
+		// мусорный запрос; ищем дальше среди остальных хостов.
+		if h.File == "" {
+			continue
+		}
+		// Мать может вернуть file в формате "путь|доп-данные" — берём только путь.
+		return strings.Split(h.File, "|")[0], nil
 	}
-	return "", fmt.Errorf("MAC %s не найден", mac)
+	return "", fmt.Errorf("host not found by mac %s", mac)
 }

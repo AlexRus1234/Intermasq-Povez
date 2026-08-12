@@ -17,9 +17,14 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"povez/api"
 )
 
 func TestConfig_ApplyDefaults_FillsAll(t *testing.T) {
@@ -153,5 +158,27 @@ func TestIntermasqAPIKey_Priority(t *testing.T) {
 	t.Setenv("INTERMASQ_KEY", "")
 	if got := intermasqAPIKey(cfg); got != "from-config" {
 		t.Errorf("config fallback failed, got %q", got)
+	}
+}
+
+// TestBuildMux_ServesEmbeddedIndex verifies that the UI handler serves the
+// embedded index.html (и не зависит от CWD процесса).
+func TestBuildMux_ServesEmbeddedIndex(t *testing.T) {
+	mux := buildMux(api.NewApiServer(nil))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if !strings.HasPrefix(strings.ToLower(rec.Body.String()), "<!doctype") &&
+		!strings.Contains(rec.Body.String(), "<html") {
+		t.Errorf("body does not look like HTML: %q", rec.Body.String())
+	}
+	ct := rec.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want prefix %q", ct, "text/html")
 	}
 }

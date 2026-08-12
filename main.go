@@ -23,6 +23,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +38,9 @@ import (
 	"povez/api"
 	"povez/core"
 )
+
+//go:embed index.html
+var indexHTML []byte
 
 // version вшивается через -ldflags "-X main.version=..." в CI.
 var version = "dev"
@@ -226,7 +230,8 @@ func buildMux(apiServer *api.ApiServer) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "index.html")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(indexHTML)
 	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

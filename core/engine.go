@@ -33,6 +33,14 @@ type EngineSettings struct {
 	CertSettle time.Duration // пауза перед финальным /stop в ReplayCaddy
 }
 
+// Engine координирует PVE, Intermasq, Caddy и StateStore для provisioning-а.
+//
+// Соглашение о State (nil-семантика):
+//   - ReplayCaddy требует State и возвращает ошибку при nil.
+//   - Provision/Deprovision опционально пишут в State: при nil запись
+//     молча пропускается (нужно для тестов без реальной ФС).
+//   - GetState при nil возвращает пустой список, а не ошибку.
+//   - В продакшене State всегда не-nil; nil используется только в тестах.
 type Engine struct {
 	PVE      *PveClient
 	IMQ      *IntermasqClient
@@ -83,10 +91,29 @@ func (e *Engine) GetPendingDevices() ([]PendingDevice, error) {
 	return pending, nil
 }
 
+// makeIDs строит идентификаторы Caddy route и TLS-сертификата по конвенции
+// proxy-<vmid>-<node> / tls-<vmid>-<node>.
+func makeIDs(info *ContainerInfo) (routeID, tlsID string) {
+	routeID = fmt.Sprintf("proxy-%d-%s", info.VMID, info.NodeKey)
+	tlsID = fmt.Sprintf("tls-%d-%s", info.VMID, info.NodeKey)
+	return routeID, tlsID
+}
+
+// computeIP формирует IP контейнера из подсети ноды и смещения VMID.
+// Последний октет = VMID - VMIDBase и обязан лежать в [0, 255].
+func (e *Engine) computeIP(info *ContainerInfo, nodeConf NodeConfig) (string, error) {
+	lastOctet := info.VMID - e.settings.VMIDBase
+	if lastOctet < 0 || lastOctet > 255 {
+		return "", fmt.Errorf("%w: последний октет %d вне диапазона [0,255] (vmid=%d, base=%d)",
+			ErrInvalidIP, lastOctet, info.VMID, e.settings.VMIDBase)
+	}
+	return fmt.Sprintf("%s.%d", nodeConf.Subnet, lastOctet), nil
+}
+
 func (e *Engine) Provision(mac string, dnsOnly bool) (string, error) {
 	info, err := e.PVE.FindByMAC(mac)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("find by mac: %w: %w", ErrContainerNotFound, err)
 	}
 
 	nodeConf, ok := e.Nodes[info.NodeKey]
@@ -94,7 +121,10 @@ func (e *Engine) Provision(mac string, dnsOnly bool) (string, error) {
 		return "", fmt.Errorf("config not found for node %q", info.NodeKey)
 	}
 
-	newIP := fmt.Sprintf("%s.%d", nodeConf.Subnet, info.VMID-e.settings.VMIDBase)
+	newIP, err := e.computeIP(info, nodeConf)
+	if err != nil {
+		return "", err
+	}
 
 	octets := strings.Split(nodeConf.Subnet, ".")
 	if len(octets) < 3 {
@@ -107,8 +137,7 @@ func (e *Engine) Provision(mac string, dnsOnly bool) (string, error) {
 	dnsmasqFile := fmt.Sprintf("%s/%sx%02d.conf", e.settings.DnsmasqDir, strings.ToLower(info.RealNode), subnetOctet)
 
 	domain := fmt.Sprintf("%s.%s%s", strings.ToLower(info.Name), strings.ToLower(info.RealNode), e.Domain)
-	routeID := fmt.Sprintf("proxy-%d-%s", info.VMID, info.NodeKey)
-	tlsID := fmt.Sprintf("tls-%d-%s", info.VMID, info.NodeKey)
+	routeID, tlsID := makeIDs(info)
 
 	if info.IsCaddy {
 		if err := e.IMQ.AddHost(mac, newIP, info.Name, e.settings.CaddyFile); err != nil {
@@ -148,7 +177,7 @@ func (e *Engine) Provision(mac string, dnsOnly bool) (string, error) {
 func (e *Engine) Deprovision(mac string) error {
 	info, err := e.PVE.FindByMAC(mac)
 	if err != nil {
-		return err
+		return fmt.Errorf("find by mac: %w: %w", ErrContainerNotFound, err)
 	}
 
 	status, err := e.PVE.GetStatus(info.NodeKey, info.VMID)
@@ -156,11 +185,10 @@ func (e *Engine) Deprovision(mac string) error {
 		return fmt.Errorf("get container status: %w", err)
 	}
 	if status != "stopped" {
-		return fmt.Errorf("container is running (status=%q), stop it first", status)
+		return fmt.Errorf("%w: status=%q, stop it first", ErrContainerRunning, status)
 	}
 
-	routeID := fmt.Sprintf("proxy-%d-%s", info.VMID, info.NodeKey)
-	tlsID := fmt.Sprintf("tls-%d-%s", info.VMID, info.NodeKey)
+	routeID, tlsID := makeIDs(info)
 
 	if err := e.Caddy.DeleteRouteAndTLS(info.NodeKey, routeID, tlsID); err != nil {
 		slog.Warn("caddy delete failed", "mac", mac, "err", err)

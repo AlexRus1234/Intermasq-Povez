@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -20,6 +21,7 @@ type RouteRecord struct {
 
 type StateStore struct {
 	path string
+	mu   sync.Mutex
 }
 
 func NewStateStore(path string) *StateStore {
@@ -27,6 +29,20 @@ func NewStateStore(path string) *StateStore {
 }
 
 func (s *StateStore) Load() ([]RouteRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.load()
+}
+
+func (s *StateStore) Save(records []RouteRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.save(records)
+}
+
+// load и save предполагают, что мьютекс уже захвачен вызывающей стороной,
+// чтобы Upsert/Remove могли выполнять Load→mutate→Save атомарно.
+func (s *StateStore) load() ([]RouteRecord, error) {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -44,7 +60,7 @@ func (s *StateStore) Load() ([]RouteRecord, error) {
 	return records, nil
 }
 
-func (s *StateStore) Save(records []RouteRecord) error {
+func (s *StateStore) save(records []RouteRecord) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0750); err != nil {
 		return err
 	}
@@ -60,30 +76,29 @@ func (s *StateStore) Save(records []RouteRecord) error {
 }
 
 func (s *StateStore) Upsert(rec RouteRecord) error {
-	records, err := s.Load()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	records, err := s.load()
 	if err != nil {
 		return err
 	}
-	if rec.UpdatedAt == "" {
-		rec.UpdatedAt = time.Now().Format(time.RFC3339)
-	}
-	found := false
+	rec.UpdatedAt = time.Now().Format(time.RFC3339)
 	for i, r := range records {
 		if r.RouteID == rec.RouteID {
-			rec.UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i] = rec
-			found = true
-			break
+			return s.save(records)
 		}
 	}
-	if !found {
-		records = append(records, rec)
-	}
-	return s.Save(records)
+	records = append(records, rec)
+	return s.save(records)
 }
 
 func (s *StateStore) Remove(routeID string) error {
-	records, err := s.Load()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	records, err := s.load()
 	if err != nil {
 		return err
 	}
@@ -93,5 +108,5 @@ func (s *StateStore) Remove(routeID string) error {
 			filtered = append(filtered, r)
 		}
 	}
-	return s.Save(filtered)
+	return s.save(filtered)
 }

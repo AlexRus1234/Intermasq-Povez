@@ -19,6 +19,8 @@ package core
 import (
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -115,5 +117,40 @@ func TestStateStore_Remove(t *testing.T) {
 	// Removing a non-existent id is a no-op, not an error.
 	if err := s.Remove("does-not-exist"); err != nil {
 		t.Errorf("Remove non-existent should be no-op, got %v", err)
+	}
+}
+
+func TestStateStore_ConcurrentUpsertNoLostRecords(t *testing.T) {
+	s := NewStateStore(filepath.Join(t.TempDir(), "routes.json"))
+
+	const n = 50
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			if err := s.Upsert(RouteRecord{
+				RouteID: "proxy-" + strconv.Itoa(i) + "-node",
+				Domain:  "r" + strconv.Itoa(i) + ".test",
+			}); err != nil {
+				t.Errorf("Upsert %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	got, err := s.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(got) != n {
+		t.Fatalf("expected %d records, got %d (lost updates)", n, len(got))
+	}
+	seen := make(map[string]bool, n)
+	for _, r := range got {
+		if seen[r.RouteID] {
+			t.Errorf("duplicate RouteID after concurrent Upsert: %q", r.RouteID)
+		}
+		seen[r.RouteID] = true
 	}
 }
