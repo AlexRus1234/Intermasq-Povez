@@ -16,9 +16,14 @@
 
 name: Зеркалирование Povez
 
-# Ручной запуск кнопкой (не по пушу).
+# Срабатывает при каждом пуше в основную ветку и по тегам.
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
 
 jobs:
   sync-mirrors:
