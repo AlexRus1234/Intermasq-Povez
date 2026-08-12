@@ -39,15 +39,19 @@ func NewIntermasqClient(url, apiKey string) *IntermasqClient {
 
 func (c *IntermasqClient) doRequest(method, endpoint string, body io.Reader) ([]byte, error) {
 	req, err := http.NewRequest(method, c.BaseURL+endpoint, body)
-	if err != nil { return nil, err }
-	
+	if err != nil {
+		return nil, err
+	}
+
 	req.Header.Set("X-API-Key", c.ApiKey)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
 	resp, err := c.client.Do(req)
-	if err != nil { return nil, fmt.Errorf("Intermasq connection error: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("Intermasq connection error: %w", err)
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
@@ -59,7 +63,9 @@ func (c *IntermasqClient) doRequest(method, endpoint string, body io.Reader) ([]
 
 func (c *IntermasqClient) GetLeases() ([]LeaseEntry, error) {
 	body, err := c.doRequest("GET", "/leases", nil)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	var leases []LeaseEntry
 	err = json.Unmarshal(body, &leases)
 	return leases, err
@@ -67,7 +73,9 @@ func (c *IntermasqClient) GetLeases() ([]LeaseEntry, error) {
 
 func (c *IntermasqClient) GetHosts() ([]HostEntry, error) {
 	body, err := c.doRequest("GET", "/hosts", nil)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	var hosts []HostEntry
 	err = json.Unmarshal(body, &hosts)
 	return hosts, err
@@ -100,7 +108,9 @@ func (c *IntermasqClient) Reload() error {
 // текущий список хостов матери.
 func (c *IntermasqClient) FindFileByMAC(mac string) (string, error) {
 	hosts, err := c.GetHosts()
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 
 	mac = strings.ToLower(mac)
 	for _, h := range hosts {

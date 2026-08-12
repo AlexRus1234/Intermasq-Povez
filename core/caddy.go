@@ -83,7 +83,7 @@ func GenerateRouteJSON(domain, targetIP, targetPort, protocol, routeID string) m
 		"transport": transport,
 	}
 	return map[string]interface{}{
-		"@id":   routeID,
+		"@id":    routeID,
 		"match":  []interface{}{map[string]interface{}{"host": []string{domain}}},
 		"handle": []interface{}{handler},
 	}
