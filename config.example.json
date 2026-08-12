@@ -1,0 +1,22 @@
+{
+    "intermasq_url": "http://127.0.0.1:8080/api",
+    "intermasq_key": "REPLACE_WITH_INTERMASQ_API_KEY",
+    "base_domain": ".internal",
+
+    "nodes": {
+        "node00": {
+            "subnet": "172.20.5",
+            "caddy_url": "http://127.0.0.1:2019",
+            "pve_url": "https://127.0.0.1:8006/api2/json",
+            "pve_token_id": "user@pam!token_name",
+            "pve_secret": "REPLACE_WITH_PVE_API_TOKEN_SECRET"
+        },
+        "node01": {
+            "subnet": "172.20.6",
+            "caddy_url": "http://127.0.0.1:2019",
+            "pve_url": "https://127.0.0.1:8006/api2/json",
+            "pve_token_id": "user@pam!token_name",
+            "pve_secret": "REPLACE_WITH_PVE_API_TOKEN_SECRET"
+        }
+    }
+}

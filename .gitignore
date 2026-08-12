@@ -1,3 +1,13 @@
+# Build artifacts (legacy yadr-prov + current povez names)
 yadr-prov
 yadr-prov-linux
+povez
+povez-linux
 *.exe
+
+# Runtime config with secrets — never commit. Copy config.example.json
+# to config.json and fill in real credentials locally.
+config.json
+
+# CI / coverage artifacts
+coverage.out
