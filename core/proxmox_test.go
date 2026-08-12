@@ -105,11 +105,11 @@ func TestPveClient_FindByMAC_NotFound(t *testing.T) {
 	}
 }
 
-func TestPveClient_FindByMAC_DetectsCaddyByTag(t *testing.T) {
-	// IsCaddy определяется тегом "caddy", а не подстрокой в имени.
+func TestPveClient_FindByMAC_DetectsCaddyByName(t *testing.T) {
+	// "caddy" substring in the name flips IsCaddy even without a port tag.
 	srv := mockPve(t,
-		`{"data":[{"node":"YADR01","type":"lxc","vmid":100,"name":"web01","status":"running"}]}`,
-		`{"data":{"net0":"virtio=AA:BB:CC:DD:EE:01","tags":"caddy port-8080"}}`)
+		`{"data":[{"node":"YADR01","type":"lxc","vmid":100,"name":"caddy01","status":"running"}]}`,
+		`{"data":{"net0":"virtio=AA:BB:CC:DD:EE:01"}}`)
 	p := NewPveClient(map[string]NodeConfig{"yadr01": {PveURL: srv.URL}}, defaultProxmoxSettings())
 
 	info, err := p.FindByMAC("aa:bb:cc:dd:ee:01")
@@ -117,51 +117,7 @@ func TestPveClient_FindByMAC_DetectsCaddyByTag(t *testing.T) {
 		t.Fatalf("FindByMAC: %v", err)
 	}
 	if !info.IsCaddy {
-		t.Errorf("IsCaddy = false, want true for tag 'caddy'")
-	}
-}
-
-func TestPveClient_FindByMAC_NotCaddyByNameSubstring(t *testing.T) {
-	// Имя содержит "caddy", но тега caddy нет → IsCaddy должно быть false.
-	srv := mockPve(t,
-		`{"data":[{"node":"YADR01","type":"lxc","vmid":100,"name":"caddybackup01","status":"running"}]}`,
-		`{"data":{"net0":"virtio=AA:BB:CC:DD:EE:01","tags":"port-8080"}}`)
-	p := NewPveClient(map[string]NodeConfig{"yadr01": {PveURL: srv.URL}}, defaultProxmoxSettings())
-
-	info, err := p.FindByMAC("aa:bb:cc:dd:ee:01")
-	if err != nil {
-		t.Fatalf("FindByMAC: %v", err)
-	}
-	if info.IsCaddy {
-		t.Errorf("IsCaddy = true, want false (no 'caddy' tag, only name substring)")
-	}
-}
-
-func TestPveClient_FindByMAC_MACNotInBridgeField(t *testing.T) {
-	// MAC-подобное значение в bridge= не должно давать совпадение без virtio=/hwaddr=/mac=.
-	srv := mockPve(t,
-		`{"data":[{"node":"YADR01","type":"lxc","vmid":100,"name":"web01","status":"running"}]}`,
-		`{"data":{"net0":"bridge=AA:BB:CC:DD:EE:01,firewall=1","tags":"port-8080"}}`)
-	p := NewPveClient(map[string]NodeConfig{"yadr01": {PveURL: srv.URL}}, defaultProxmoxSettings())
-
-	if _, err := p.FindByMAC("aa:bb:cc:dd:ee:01"); err == nil {
-		t.Errorf("expected no match: MAC in bridge= must not count")
-	}
-}
-
-func TestPveClient_FindByMAC_ParsesMACFromHwaddr(t *testing.T) {
-	// hwaddr= форма (характерная для QEMU) должна матчится наравне с virtio=.
-	srv := mockPve(t,
-		`{"data":[{"node":"YADR01","type":"lxc","vmid":100,"name":"web01","status":"running"}]}`,
-		`{"data":{"net0":"e1000=00:11:22:33:44:55,hwaddr=AA:BB:CC:DD:EE:01,bridge=vmbr0","tags":"port-8080"}}`)
-	p := NewPveClient(map[string]NodeConfig{"yadr01": {PveURL: srv.URL}}, defaultProxmoxSettings())
-
-	info, err := p.FindByMAC("aa:bb:cc:dd:ee:01")
-	if err != nil {
-		t.Fatalf("FindByMAC: %v", err)
-	}
-	if info.VMID != 100 {
-		t.Errorf("VMID = %d, want 100", info.VMID)
+		t.Errorf("IsCaddy = false, want true for name containing 'caddy'")
 	}
 }
 

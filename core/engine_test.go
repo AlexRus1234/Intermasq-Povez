@@ -21,16 +21,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 	"time"
 )
-
-// testStateStore возвращает StateBackend во временной директории теста.
-func testStateStore(t *testing.T) StateBackend {
-	t.Helper()
-	return NewStateStore(filepath.Join(t.TempDir(), "routes.json"))
-}
 
 // mockIntermasq serves /hosts and /leases JSON lists. A device is "pending"
 // iff its MAC appears in /leases but not in /hosts.
@@ -58,7 +51,7 @@ func TestEngine_GetPendingDevices_FiltersKnownMacs(t *testing.T) {
 			{"mac":"AA:BB:CC:DD:EE:02","ip":"10.0.0.2","hostname":"h2"}
 		]`)
 	imq := NewIntermasqClient(srv.URL, "key", 5*time.Second)
-	e := NewEngine(nil, imq, nil, testStateStore(t), "", nil, EngineSettings{})
+	e := &Engine{IMQ: imq}
 
 	pending, err := e.GetPendingDevices()
 	if err != nil {
@@ -78,7 +71,7 @@ func TestEngine_GetPendingDevices_FiltersKnownMacs(t *testing.T) {
 func TestEngine_GetPendingDevices_EmptyLeases(t *testing.T) {
 	srv := mockIntermasq(t, `[]`, `[]`)
 	imq := NewIntermasqClient(srv.URL, "key", 5*time.Second)
-	e := NewEngine(nil, imq, nil, testStateStore(t), "", nil, EngineSettings{})
+	e := &Engine{IMQ: imq}
 
 	pending, err := e.GetPendingDevices()
 	if err != nil {
@@ -96,7 +89,7 @@ func TestEngine_GetPendingDevices_CaseInsensitiveMAC(t *testing.T) {
 		`[{"mac":"aa:bb:cc:dd:ee:01","ip":"10.0.0.1","hostname":"h1","file":"f"}]`,
 		`[{"mac":"AA:BB:CC:DD:EE:01","ip":"10.0.0.1","hostname":"h1"}]`)
 	imq := NewIntermasqClient(srv.URL, "key", 5*time.Second)
-	e := NewEngine(nil, imq, nil, testStateStore(t), "", nil, EngineSettings{})
+	e := &Engine{IMQ: imq}
 
 	pending, err := e.GetPendingDevices()
 	if err != nil {
@@ -113,7 +106,7 @@ func TestEngine_GetPendingDevices_HostsError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	imq := NewIntermasqClient(srv.URL, "key", 5*time.Second)
-	e := NewEngine(nil, imq, nil, testStateStore(t), "", nil, EngineSettings{})
+	e := &Engine{IMQ: imq}
 
 	if _, err := e.GetPendingDevices(); err == nil {
 		t.Errorf("expected error when /hosts returns 500, got nil")
@@ -135,7 +128,7 @@ func TestMakeIDs(t *testing.T) {
 // через computeIP (используется Provision). Октет = VMID - VMIDBase и обязан
 // лежать в [0,255], иначе ErrInvalidIP.
 func TestEngine_Provision_IPValidation(t *testing.T) {
-	e := NewEngine(nil, nil, nil, testStateStore(t), "", nil, EngineSettings{VMIDBase: 100})
+	e := &Engine{settings: EngineSettings{VMIDBase: 100}}
 	nodeConf := NodeConfig{Subnet: "172.20.5"}
 
 	tests := []struct {
@@ -191,7 +184,7 @@ func mockPveRunning(t *testing.T) *httptest.Server {
 func TestEngine_Deprovision_ContainerRunning(t *testing.T) {
 	srv := mockPveRunning(t)
 	pve := NewPveClient(map[string]NodeConfig{"yadr01": {PveURL: srv.URL}}, defaultProxmoxSettings())
-	e := NewEngine(pve, nil, nil, testStateStore(t), "", nil, EngineSettings{})
+	e := &Engine{PVE: pve}
 
 	err := e.Deprovision("aa:bb:cc:dd:ee:01")
 	if !errors.Is(err, ErrContainerRunning) {

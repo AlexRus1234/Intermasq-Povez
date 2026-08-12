@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -45,7 +44,7 @@ func newMockEngine(t *testing.T, hostsBody, leasesBody string) *core.Engine {
 	}))
 	t.Cleanup(srv.Close)
 	imq := core.NewIntermasqClient(srv.URL, "key", 5*time.Second)
-	return core.NewEngine(nil, imq, nil, core.NewStateStore(filepath.Join(t.TempDir(), "routes.json")), ".test", nil, core.EngineSettings{})
+	return core.NewEngine(nil, imq, nil, nil, ".test", nil, core.EngineSettings{})
 }
 
 // newMockPveEngine строит Engine, чей PveClient смотрит на локальный мок PVE.
@@ -67,7 +66,7 @@ func newMockPveEngine(t *testing.T, resourcesBody, configBody string) *core.Engi
 		map[string]core.NodeConfig{"yadr01": {PveURL: srv.URL}},
 		core.ProxmoxSettings{PortPrefix: "port-", ProtoPrefix: "proto-", NamePrefix: "name-"},
 	)
-	return core.NewEngine(pve, nil, nil, core.NewStateStore(filepath.Join(t.TempDir(), "routes.json")), ".test", nil, core.EngineSettings{})
+	return core.NewEngine(pve, nil, nil, nil, ".test", nil, core.EngineSettings{})
 }
 
 func TestHandleGetPending_OK(t *testing.T) {
@@ -203,9 +202,9 @@ func TestHandleDeprovision_RunningContainer_MapsTo409(t *testing.T) {
 	}
 }
 
-func TestHandleGetState_EmptyForFreshState(t *testing.T) {
-	// Fresh StateStore with no routes file → empty list, not error.
-	e := core.NewEngine(nil, nil, nil, core.NewStateStore(filepath.Join(t.TempDir(), "routes.json")), "", nil, core.EngineSettings{})
+func TestHandleGetState_EmptyWhenNoState(t *testing.T) {
+	// Engine with nil State → GetState returns empty slice, not error.
+	e := core.NewEngine(nil, nil, nil, nil, "", nil, core.EngineSettings{})
 	s := NewApiServer(e)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
@@ -224,27 +223,16 @@ func TestHandleGetState_EmptyForFreshState(t *testing.T) {
 	}
 }
 
-func TestHandleReplay_EmptyStateReturnsOKWithZeroCount(t *testing.T) {
-	// Fresh StateStore with no routes file → ReplayCaddy returns (0, nil, nil)
-	// → handler responds 200 with {"ok":0,"errors":[]}.
-	e := core.NewEngine(nil, nil, nil, core.NewStateStore(filepath.Join(t.TempDir(), "routes.json")), "", nil, core.EngineSettings{})
+func TestHandleReplay_NoStateReturns500(t *testing.T) {
+	// Engine with nil State → ReplayCaddy errors → handler 500.
+	e := core.NewEngine(nil, nil, nil, nil, "", nil, core.EngineSettings{})
 	s := NewApiServer(e)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/replay", nil)
 	rec := httptest.NewRecorder()
 	s.HandleReplay(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var got replayResponse
-	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
-		t.Fatalf("decode body: %v", err)
-	}
-	if got.OK != 0 {
-		t.Errorf("ok = %d, want 0", got.OK)
-	}
-	if len(got.Errors) != 0 {
-		t.Errorf("errors = %#v, want empty", got.Errors)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
 	}
 }

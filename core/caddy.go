@@ -18,17 +18,14 @@ package core
 
 import (
 	"bytes"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
-	"net/url"
-	"os"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -90,95 +87,44 @@ func (c *CaddyClient) doJSON(method, url string, body interface{}) (*http.Respon
 	return c.client.Do(req)
 }
 
-// caddyRoute / caddyMatch / caddyHandler / caddyUpstream / caddyTransport /
-// caddyTLS — типизированное представление reverse_proxy-маршрута Caddy. Поля
-// отсортированы по JSON-тегу, чтобы маршалинг был побайтово идентичен старому
-// выводу через map[string]interface{} (keys сортируются алфавитом).
-type caddyRoute struct {
-	ID     string         `json:"@id"`
-	Handle []caddyHandler `json:"handle"`
-	Match  []caddyMatch   `json:"match"`
-}
-
-type caddyMatch struct {
-	Host []string `json:"host"`
-}
-
-type caddyHandler struct {
-	Handler   string          `json:"handler"`
-	Transport caddyTransport  `json:"transport"`
-	Upstreams []caddyUpstream `json:"upstreams"`
-}
-
-type caddyUpstream struct {
-	Dial string `json:"dial"`
-}
-
-type caddyTransport struct {
-	Protocol string    `json:"protocol"`
-	TLS      *caddyTLS `json:"tls,omitempty"`
-}
-
-type caddyTLS struct {
-	InsecureSkipVerify bool `json:"insecure_skip_verify"`
-}
-
-// caddyTLSPolicy / caddyIssuer / caddyChallenges / caddyHTTPChallenge —
-// типизированное представление automation policy для Step-CA ACME.
-type caddyTLSPolicy struct {
-	ID       string        `json:"@id"`
-	Issuers  []caddyIssuer `json:"issuers"`
-	Subjects []string      `json:"subjects"`
-}
-
-type caddyIssuer struct {
-	CA                   string          `json:"ca"`
-	Challenges           caddyChallenges `json:"challenges"`
-	Module               string          `json:"module"`
-	TrustedRootsPEMFiles []string        `json:"trusted_roots_pem_files"`
-}
-
-type caddyChallenges struct {
-	HTTP caddyHTTPChallenge `json:"http"`
-}
-
-type caddyHTTPChallenge struct {
-	Disabled bool `json:"disabled"`
-}
-
 // generateRouteJSON строит конфиг reverse_proxy-маршрута. Для https upstream
 // добавляет transport.tls.insecure_skip_verify из настроек клиента (внутренние
 // сервисы обычно с self-signed сертификатом).
-func (c *CaddyClient) generateRouteJSON(domain, targetIP, targetPort, protocol, routeID string) caddyRoute {
-	handler := caddyHandler{
-		Handler:   "reverse_proxy",
-		Upstreams: []caddyUpstream{{Dial: fmt.Sprintf("%s:%s", targetIP, targetPort)}},
-		Transport: caddyTransport{Protocol: "http"},
-	}
+func (c *CaddyClient) generateRouteJSON(domain, targetIP, targetPort, protocol, routeID string) map[string]interface{} {
+	upstream := map[string]interface{}{"dial": fmt.Sprintf("%s:%s", targetIP, targetPort)}
+	transport := map[string]interface{}{"protocol": "http"}
 	if protocol == "https" {
-		handler.Transport.TLS = &caddyTLS{InsecureSkipVerify: c.settings.UpstreamInsecure}
+		transport["tls"] = map[string]interface{}{"insecure_skip_verify": c.settings.UpstreamInsecure}
 	}
-	return caddyRoute{
-		ID:     routeID,
-		Handle: []caddyHandler{handler},
-		Match:  []caddyMatch{{Host: []string{domain}}},
+	handler := map[string]interface{}{
+		"handler":   "reverse_proxy",
+		"upstreams": []interface{}{upstream},
+		"transport": transport,
+	}
+	return map[string]interface{}{
+		"@id":    routeID,
+		"match":  []interface{}{map[string]interface{}{"host": []string{domain}}},
+		"handle": []interface{}{handler},
 	}
 }
 
 // generateTLSPolicy формирует политику TLS: HTTP-01 челлендж отключён,
-// сертификат выпускается через Step-CA ACME по настройкам клиента.
-func (c *CaddyClient) generateTLSPolicy(domain, tlsID string) caddyTLSPolicy {
-	return caddyTLSPolicy{
-		ID:       tlsID,
-		Subjects: []string{domain},
-		Issuers: []caddyIssuer{{
-			Module:               "acme",
-			CA:                   c.settings.ACMEURL,
-			TrustedRootsPEMFiles: []string{c.settings.CARoots},
-			Challenges: caddyChallenges{
-				HTTP: caddyHTTPChallenge{Disabled: true},
+// сертификат выпускается через Step-CA ACME. Метод — использует настройки
+// клиента (ACME URL, CA roots) из CaddySettings.
+func (c *CaddyClient) generateTLSPolicy(domain, tlsID string) map[string]interface{} {
+	return map[string]interface{}{
+		"@id":      tlsID,
+		"subjects": []string{domain},
+		"issuers": []map[string]interface{}{
+			{
+				"module":                  "acme",
+				"ca":                      c.settings.ACMEURL,
+				"trusted_roots_pem_files": []string{c.settings.CARoots},
+				"challenges": map[string]interface{}{
+					"http": map[string]interface{}{"disabled": true},
+				},
 			},
-		}},
+		},
 	}
 }
 
@@ -195,7 +141,7 @@ func (c *CaddyClient) generateTLSPolicy(domain, tlsID string) caddyTLSPolicy {
 // если родитель уже есть, init пропускается и возвращается исходная ошибка.
 func (c *CaddyClient) upsertByID(
 	baseURL, id, createPath string,
-	payload interface{},
+	payload map[string]interface{},
 	parentExists func() (bool, error),
 	initIfMissing func() error,
 ) error {
@@ -212,10 +158,7 @@ func (c *CaddyClient) upsertByID(
 
 	// Существующий @id → обновляем через PUT.
 	if getResp.StatusCode == http.StatusOK {
-		req, err := http.NewRequest("PUT", fmt.Sprintf("%s/id/%s", baseURL, id), bytes.NewBuffer(data))
-		if err != nil {
-			return fmt.Errorf("build request: %w", err)
-		}
+		req, _ := http.NewRequest("PUT", fmt.Sprintf("%s/id/%s", baseURL, id), bytes.NewBuffer(data))
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := c.client.Do(req)
 		if err != nil {
@@ -238,10 +181,7 @@ func (c *CaddyClient) upsertByID(
 	}
 
 	// 404 — запись действительно отсутствует, создаём через POST.
-	req, err := http.NewRequest("POST", baseURL+createPath, bytes.NewBuffer(data))
-	if err != nil {
-		return fmt.Errorf("build request: %w", err)
-	}
+	req, _ := http.NewRequest("POST", baseURL+createPath, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -266,10 +206,7 @@ func (c *CaddyClient) upsertByID(
 		if err := initIfMissing(); err != nil {
 			return err
 		}
-		req2, err := http.NewRequest("POST", baseURL+createPath, bytes.NewBuffer(data))
-		if err != nil {
-			return fmt.Errorf("build request: %w", err)
-		}
+		req2, _ := http.NewRequest("POST", baseURL+createPath, bytes.NewBuffer(data))
 		req2.Header.Set("Content-Type", "application/json")
 		resp2, err := c.client.Do(req2)
 		if err != nil {
@@ -339,7 +276,7 @@ func (c *CaddyClient) disableLocalCerts(baseURL string) error {
 }
 
 // initTLSParent создаёт родительский контейнер /config/apps/tls.
-func (c *CaddyClient) initTLSParent(baseURL string, tlsPolicy interface{}) error {
+func (c *CaddyClient) initTLSParent(baseURL string, tlsPolicy map[string]interface{}) error {
 	resp, err := c.doJSON("PUT", baseURL+"/config/apps/tls", map[string]interface{}{
 		"automation": map[string]interface{}{
 			"policies": []interface{}{tlsPolicy},
@@ -357,7 +294,7 @@ func (c *CaddyClient) initTLSParent(baseURL string, tlsPolicy interface{}) error
 }
 
 // initSrv0 создаёт HTTP-сервер srv0, если его нет.
-func (c *CaddyClient) initSrv0(baseURL string, routeConfig interface{}) error {
+func (c *CaddyClient) initSrv0(baseURL string, routeConfig map[string]interface{}) error {
 	resp, err := c.doJSON("PUT", baseURL+"/config/apps/http/servers/srv0", map[string]interface{}{
 		"listen": []string{c.settings.Listen},
 		"routes": []interface{}{routeConfig},
@@ -421,17 +358,11 @@ func (c *CaddyClient) AddRoute(nodeName, domain, targetIP, targetPort, protocol,
 		return err
 	}
 
-	// Ждём, пока Caddy запишет свежий сертификат Step-CA и начнёт его
-	// обслуживать на TLS-порту, затем убиваем процесс — systemd поднимет
-	// его, и при старте cert загрузится с диска, минуя плохой кэш.
-	slog.Info("caddy route installed, waiting for cert before restart", "domain", domain)
-	maxWait := c.settings.CertSettleTime * 15
-	if maxWait < 5*time.Second {
-		maxWait = 30 * time.Second
-	}
-	if err := c.WaitForCert(nodeName, domain, maxWait); err != nil {
-		slog.Warn("cert poll failed, restarting anyway", "domain", domain, "err", err)
-	}
+	// Ждём, пока Caddy запишет свежий сертификат Step-CA на диск, затем
+	// убиваем процесс — systemd поднимет его, и при старте cert загрузится
+	// с диска, минуя плохой кэш.
+	slog.Info("caddy route installed, waiting before restart", "domain", domain, "settle", c.settings.CertSettleTime)
+	time.Sleep(c.settings.CertSettleTime)
 	if err := c.RestartCaddy(nodeName); err != nil {
 		return fmt.Errorf("restart: %w", err)
 	}
@@ -477,9 +408,11 @@ func (c *CaddyClient) DeleteRouteAndTLS(nodeName, routeID, tlsID string) error {
 	return nil
 }
 
-// RestartCaddy шлёт POST /stop. Systemd (Restart=always) поднимает Caddy обратно.
-// Процесс умирает прямо во время ответа, поэтому любые транспортные ошибки
-// (обрыв/reset/EOF) и ошибки чтения тела считаются нормой и игнорируются.
+// RestartCaddy шлёт POST /stop. Systemd (Restart=always) поднимет Caddy обратно.
+// POST /stop убивает процесс Caddy, поэтому HTTP-ответ может оборваться
+// посередине (connection closed / reset) — это ожидаемое поведение, а не
+// ошибка. Такие ошибки чтения мы игнорируем; всё остальное (включая реально
+// пришедший не-2xx статус) трактуем как ошибку.
 func (c *CaddyClient) RestartCaddy(nodeName string) error {
 	baseURL, err := c.baseURL(nodeName)
 	if err != nil {
@@ -488,102 +421,26 @@ func (c *CaddyClient) RestartCaddy(nodeName string) error {
 	slog.Info("caddy restart (POST /stop)", "node", nodeName)
 	resp, err := c.doJSON("POST", baseURL+"/stop", nil)
 	if err != nil {
-		slog.Info("caddy /stop transport error (expected, process is dying)", "node", nodeName, "err", err)
-		return nil
+		if isConnClosedErr(err) {
+			return nil
+		}
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("restart /stop (%d): %s", resp.StatusCode, string(body))
 	}
-	if _, rerr := io.ReadAll(resp.Body); rerr != nil {
-		slog.Info("caddy /stop body read error (expected, process is dying)", "node", nodeName, "err", rerr)
+	if _, rerr := io.ReadAll(resp.Body); rerr != nil && !isConnClosedErr(rerr) {
+		return rerr
 	}
 	return nil
 }
 
-// WaitForCert опрашивает TLS-порт узла, пока Caddy не начнёт отдавать сертификат
-// для domain (или пока не истечёт maxWait). Заменяет слепой time.Sleep в AddRoute.
-func (c *CaddyClient) WaitForCert(nodeName, domain string, maxWait time.Duration) error {
-	baseURL, err := c.baseURL(nodeName)
-	if err != nil {
-		return err
-	}
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return fmt.Errorf("parse base url: %w", err)
-	}
-	host := u.Hostname()
-
-	port := strings.TrimPrefix(c.settings.Listen, ":")
-	if port == "" {
-		port = "443"
-	}
-	addr := net.JoinHostPort(host, port)
-
-	// Подгружаем CA-корни; если файл недоступен или не парсится — переключаемся
-	// на небезопасный режим с ручной проверкой leaf-сертификата по subject.
-	insecure := false
-	var roots *x509.CertPool
-	if c.settings.CARoots == "" {
-		insecure = true
-	} else if pem, rerr := os.ReadFile(c.settings.CARoots); rerr != nil {
-		slog.Warn("cert roots unreadable, falling back to insecure check", "path", c.settings.CARoots, "err", rerr)
-		insecure = true
-	} else {
-		roots = x509.NewCertPool()
-		if !roots.AppendCertsFromPEM(pem) {
-			slog.Warn("cert roots parse failed, falling back to insecure check", "path", c.settings.CARoots)
-			insecure = true
-		}
-	}
-
-	deadline := time.Now().Add(maxWait)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		tlsConf := &tls.Config{ServerName: domain}
-		if insecure {
-			tlsConf.InsecureSkipVerify = true
-		} else {
-			tlsConf.RootCAs = roots
-		}
-		conn, derr := tls.Dial("tcp", addr, tlsConf)
-		if derr != nil {
-			lastErr = derr
-		} else {
-			matched := false
-			if leaf := leafCert(conn); leaf != nil {
-				matched = certMatches(leaf, domain)
-			}
-			conn.Close()
-			if matched {
-				return nil
-			}
-			lastErr = fmt.Errorf("connected but cert does not match %s", domain)
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return fmt.Errorf("cert for %s not ready after %s: %w", domain, maxWait, lastErr)
-}
-
-// leafCert возвращает leaf-сертификат из установленного TLS-соединения или nil.
-func leafCert(conn *tls.Conn) *x509.Certificate {
-	certs := conn.ConnectionState().PeerCertificates
-	if len(certs) == 0 {
-		return nil
-	}
-	return certs[0]
-}
-
-// certMatches проверяет, что domain совпадает с CommonName или одним из DNSNames.
-func certMatches(cert *x509.Certificate, domain string) bool {
-	if cert.Subject.CommonName == domain {
-		return true
-	}
-	for _, n := range cert.DNSNames {
-		if n == domain {
-			return true
-		}
-	}
-	return false
+// isConnClosedErr сообщает, можно ли списать ошибку на обрыв соединения при
+// остановке Caddy: EOF, UnexpectedEOF или connection reset.
+func isConnClosedErr(err error) bool {
+	return errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, syscall.ECONNRESET)
 }

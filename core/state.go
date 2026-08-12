@@ -2,7 +2,6 @@ package core
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -70,9 +69,6 @@ func (s *StateStore) save(records []RouteRecord) error {
 		return err
 	}
 	tmp := s.path + ".tmp"
-	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("clean stale tmp: %w", err)
-	}
 	if err := os.WriteFile(tmp, data, 0660); err != nil {
 		return err
 	}
