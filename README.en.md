@@ -24,11 +24,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 **Auto-provisioning plugin for [Intermasq](https://git.alexrus1234.ru/AlexRus1234/Intermasq)**
 
-Povez ties Intermasq, Proxmox VE and Caddy together: given the MAC of a new
-container, it automatically creates a dnsmasq DNS record and a Caddy
+Povez ties Intermasq, Proxmox VE and Caddy together: given the MAC address of a
+new container, it automatically creates a dnsmasq DNS record and a Caddy
 reverse-proxy route with a TLS certificate. It runs as a sidecar process
-spawned by the host panel under the `/etc/intermasq/plugins/` contract and
-talks to the panel over a Unix socket.
+launched by the panel under the `/etc/intermasq/plugins/` contract and
+communicates with the panel over a Unix socket.
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8.svg?style=flat-square)](https://go.dev/)
@@ -49,11 +49,12 @@ talks to the panel over a Unix socket.
 - [How it works](#how-it-works)
 - [Project structure](#project-structure)
 - [Tech stack](#tech-stack)
+- [Documentation](#documentation)
 - [License](#license)
 
 > Architectural details — the PVE tag convention, the IP-allocation formula,
-> the rationale behind the Caddy "NUKE" restart and the manifest contract —
-> live in [`docs/architecture.md`](docs/architecture.md).
+> the rationale behind the forced restart of Caddy and the manifest contract —
+> are provided in [`docs/INTERNALS.md`](docs/INTERNALS.md).
 
 The project is built against a predefined architecture; an AI assistant was
 used during source preparation.[^1]
@@ -62,17 +63,20 @@ used during source preparation.[^1]
 
 ## Features
 
-- **Discovery** of new containers: diffs the panel's ARP/dhcp leases against
-  registered hosts → a list of "pending" MACs.
-- **Auto-provisioning** by MAC: finds the container in Proxmox VE (LXC/QEMU),
-  computes the IP from the node subnet, writes a dnsmasq host record and a
-  Caddy reverse-proxy route + TLS policy.
-- **DNS-only mode** (`dnsOnly`): add only the dnsmasq record, skip Caddy.
-- **Deprovisioning**: removes the Caddy route+TLS and the dnsmasq host for a
-  stopped container.
-- **Replay**: rebuilds the Caddy config from the on-disk `routes.json` after a
-  Caddy reset (upsert every record + one restart per node).
-- **Step-CA ACME**: certificates are issued by an internal Step-CA; HTTP-01
+- **Discovery** of new containers: the panel's ARP/dhcp leases are diffed
+  against the registered hosts, producing a list of MAC addresses pending
+  assignment.
+- **Auto-provisioning** by MAC: the container is located in Proxmox VE
+  (LXC/QEMU), the IP is computed from the node subnet, and a dnsmasq host
+  record together with a Caddy reverse-proxy route and TLS policy are created.
+- **DNS-only mode** (`dnsOnly`): only the dnsmasq record is added; Caddy is not
+  contacted.
+- **Deprovisioning**: removes the Caddy route and TLS policy and the dnsmasq
+  host record for a stopped container.
+- **Replay**: rebuilds the Caddy configuration from the on-disk `routes.json`
+  after a Caddy reset or restart (upsert of every record and one restart per
+  node).
+- **Step-CA ACME**: certificates are issued by an internal Step-CA; the HTTP-01
   challenge is disabled.
 - **Intermasq contract**: `manifest.json`, Unix socket (`PLUGIN_SOCKET`),
   callbacks into the panel API via `INTERMASQ_KEY`, graceful SIGTERM handling.
@@ -207,29 +211,29 @@ separated):
 If the container name contains the substring `caddy`, it is treated as a
 Caddy host: only a dnsmasq record is created (no Caddy route).
 
-Details in [`docs/architecture.md`](docs/architecture.md).
+Details in [`docs/INTERNALS.md`](docs/INTERNALS.md).
 
 ---
 
 ## How it works
 
 1. **Discovery.** `GET /api/pending` diffs the panel's `/leases` against
-   `/hosts` — devices not yet in dnsmasq surface as pending.
-2. **Provision.** The container is looked up in PVE (`/cluster/resources` +
-   network config), port/protocol come from tags, the IP is computed as
-   `<subnet>.<VMID - vmid_base>`, a host record is written to dnsmasq, a
-   reverse_proxy route + TLS policy (Step-CA ACME) is pushed to Caddy, and
-   Caddy is hard-restarted (`POST /stop` → `Restart=always`) to apply the
-   fresh certificate.
-3. **Deprovision.** Checks the container is `stopped`, then removes the
-   Caddy route+TLS and the dnsmasq host.
+   `/hosts`; devices not yet present in dnsmasq are reported as pending.
+2. **Provision.** The container is looked up in PVE (`/cluster/resources` and
+   the network configuration); port and protocol are obtained from the tags; the
+   IP is computed as `<subnet>.<VMID - vmid_base>`. A host record is written to
+   dnsmasq, a reverse_proxy route and a TLS policy (Step-CA ACME) are pushed to
+   Caddy, and Caddy is forcibly restarted (`POST /stop` → `Restart=always`) so
+   that the newly issued certificate is applied.
+3. **Deprovision.** The container is verified to be `stopped`; the Caddy route
+   and TLS policy and the dnsmasq host record are then removed.
 4. **Replay.** Every record from `routes.json` is upserted into Caddy
    (PUT/POST by `@id`), followed by a single `/stop` per touched node.
 
-> The "NUKE" restart instead of a soft reload is an intentional workaround:
-> Caddy caches the certificate in `autosave.json`, and a soft reload does not
-> pick up a fresh cert from Step-CA. A hard restart forces it to read the cert
-> from disk. See `docs/architecture.md` for details.
+> The forced restart instead of a soft reload is intentional: Caddy caches the
+> certificate in `autosave.json`, and a soft reload does not apply a certificate
+> freshly issued by Step-CA. A forced restart forces Caddy to read the
+> certificate from disk. See `docs/INTERNALS.md` for details.
 
 ---
 
@@ -243,15 +247,18 @@ povez/
 ├── index.html           # UI (Vue 3 SPA)
 ├── go.mod
 ├── api/
-│   └── routes.go        # HTTP handlers + method guards + DTOs
+│   └── routes.go        # HTTP handlers, method guards, DTOs
 ├── core/
 │   ├── caddy.go         # Caddy admin API (upsert route/TLS, restart)
 │   ├── engine.go        # orchestrator: Provision / Deprovision / Replay
 │   ├── intermasq.go     # HTTP client for the panel API
-│   ├── proxmox.go       # PVE client (scan by MAC, tag parsing)
+│   ├── proxmox.go       # PVE client (lookup by MAC, tag parsing)
 │   └── state.go         # JSON state store (atomic write)
 ├── docs/
-│   └── architecture.md  # architecture details
+│   ├── FEATURES.md      # features
+│   ├── SETUP.md         # installation and setup
+│   ├── INTERNALS.md     # internal architecture
+│   └── CHANGELOG.md     # change log
 ├── .forgejo/workflows/  # CI: build/test/publish + mirror
 ├── LICENSE              # AGPL-3.0
 └── README.md / README.en.md
@@ -261,11 +268,20 @@ povez/
 
 ## Tech stack
 
-- **Go 1.25** — stdlib only, no external dependencies
+- **Go 1.25** — standard library only, no external dependencies
 - **Vue 3 + Bootstrap 5** — UI (CDN, no bundler)
 - **log/slog** — structured logging
 - **httptest** — tests (stdlib `testing`, no testify)
 - **Forgejo Actions** — CI on `fedora:44`
+
+---
+
+## Documentation
+
+- [`docs/FEATURES.md`](docs/FEATURES.md) — features
+- [`docs/SETUP.md`](docs/SETUP.md) — installation and setup
+- [`docs/INTERNALS.md`](docs/INTERNALS.md) — internal architecture
+- [`docs/CHANGELOG.md`](docs/CHANGELOG.md) — change log
 
 ---
 
