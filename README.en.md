@@ -1,3 +1,6 @@
+> **This is a mirror repository. The original is available at:**
+> [https://git.alexrus1234.ru/AlexRus1234/Intermasq-Povez](https://git.alexrus1234.ru/AlexRus1234/Intermasq-Povez)
+
 <!--
 Povez - Intermasq provisioning plugin
 Copyright (C) 2026 AlexRus1234
